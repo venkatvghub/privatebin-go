@@ -38,6 +38,9 @@ var Expiries = map[string]time.Duration{
 	"never":  0,
 }
 
+// migrateLockID is an arbitrary application-wide advisory lock key.
+const migrateLockID = 7260211
+
 var prefixRe = regexp.MustCompile(`^[A-Za-z0-9_]*$`)
 
 type Service struct {
@@ -72,12 +75,19 @@ func (s *Service) Migrate(prefix string) error {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s ("id" CHAR(16) NOT NULL PRIMARY KEY, "value" TEXT)`, t("config")),
 		fmt.Sprintf(`INSERT INTO %s VALUES ('VERSION', '%s') ON CONFLICT DO NOTHING`, t("config"), SchemaVersion),
 	}
-	for _, q := range stmts {
-		if err := s.db.Exec(q).Error; err != nil {
+	// CREATE ... IF NOT EXISTS is not safe against concurrent runs (two replicas,
+	// or parallel test packages), so serialise migrations with an advisory lock.
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(?)`, migrateLockID).Error; err != nil {
 			return err
 		}
-	}
-	return nil
+		for _, q := range stmts {
+			if err := tx.Exec(q).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func newID() (string, error) {
