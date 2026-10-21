@@ -1,0 +1,40 @@
+name: privatebin-go
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-privatebin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-privatebin}
+      POSTGRES_DB: ${POSTGRES_DB:-privatebin}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-privatebin}:${POSTGRES_PASSWORD:-privatebin}@db:5432/${POSTGRES_DB:-privatebin}?sslmode=disable
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  dex:
+    profiles: ["auth"]
+    image: ghcr.io/dexidp/dex:latest
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./dex/config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      - "5556:5556"
+
+volumes:
+  pgdata:

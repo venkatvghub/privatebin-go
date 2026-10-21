@@ -1,0 +1,183 @@
+openapi: 3.0.3
+info:
+  title: privatebin-go API
+  version: "2"
+  description: |
+    PrivateBin-compatible JSON API (data format v2). The server only stores ciphertext;
+    encryption happens client side and the key lives in the URL fragment.
+
+    All requests MUST send `X-Requested-With: JSONHttpRequest`. As in PrivateBin, application
+    errors are returned with HTTP 200 and `status: 1`.
+
+    Discussions (comments) are not supported: posting a comment returns `status: 1`.
+    If the server runs with `AUTH_ENABLED=true`, `POST /` additionally requires a login
+    session cookie and returns HTTP 401 otherwise.
+servers:
+  - url: /
+paths:
+  /:
+    post:
+      summary: Create a paste
+      operationId: createPaste
+      parameters:
+        - $ref: "#/components/parameters/JSONHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRequest" }
+      responses:
+        "200":
+          description: Created, or an error with `status` 1.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/CreateResponse"
+                  - $ref: "#/components/schemas/Error"
+        "401":
+          description: Login required (only when AUTH_ENABLED=true).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      summary: Read or delete a paste
+      description: |
+        `GET /?<pasteid>` or `GET /?pasteid=<id>` reads a paste. A burn-after-reading paste is
+        returned once and destroyed atomically. Adding `deletetoken` deletes instead of reading;
+        the token `burnafterreading` is accepted for burn pastes.
+      operationId: getPaste
+      parameters:
+        - $ref: "#/components/parameters/JSONHeader"
+        - name: pasteid
+          in: query
+          schema: { type: string, pattern: "^[a-f0-9]{16}$" }
+          description: Paste id. Also accepted as a bare key, `/?<id>`.
+        - name: deletetoken
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paste, deletion result, or an error with `status` 1.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PasteResponse"
+                  - $ref: "#/components/schemas/DeleteResponse"
+                  - $ref: "#/components/schemas/Error"
+  /api/config:
+    get:
+      summary: Server capabilities (privatebin-go extension)
+      operationId: getConfig
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authEnabled: { type: boolean }
+                  loggedIn: { type: boolean }
+                  maxBytes: { type: integer, format: int64 }
+  /api/paste/{id}/meta:
+    get:
+      summary: Whether a paste is burn-after-reading, without consuming it (privatebin-go extension)
+      operationId: getPasteMeta
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK or an error with `status` 1.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      status: { type: integer, enum: [0] }
+                      burn: { type: boolean }
+                  - $ref: "#/components/schemas/Error"
+  /healthz:
+    get:
+      summary: Liveness and database check
+      operationId: health
+      responses:
+        "200": { description: ok }
+        "503": { description: database unreachable }
+components:
+  parameters:
+    JSONHeader:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema: { type: string, enum: [JSONHttpRequest] }
+  schemas:
+    CipherParams:
+      type: array
+      minItems: 8
+      maxItems: 8
+      description: "[iv(b64, 12 bytes), salt(b64, 8 bytes), iterations, keysize, tagsize, \"aes\", \"gcm\", \"none\"|\"zlib\"]"
+      items: {}
+      example: ["AAAAAAAAAAAAAAAA", "AAAAAAAAAAA=", 100000, 256, 128, "aes", "gcm", "zlib"]
+    AData:
+      type: array
+      minItems: 4
+      maxItems: 4
+      description: "[CipherParams, format, opendiscussion (0|1), burnafterreading (0|1)]; authenticated as AES-GCM AAD."
+      items: {}
+      example: [["AAAAAAAAAAAAAAAA", "AAAAAAAAAAA=", 100000, 256, 128, "aes", "gcm", "zlib"], "plaintext", 0, 0]
+    CreateRequest:
+      type: object
+      required: [v, adata, ct]
+      properties:
+        v: { type: integer, enum: [2] }
+        adata: { $ref: "#/components/schemas/AData" }
+        ct: { type: string, format: byte, description: Base64 ciphertext incl. GCM tag. }
+        meta:
+          type: object
+          properties:
+            expire:
+              type: string
+              enum: [5min, 10min, 1hour, 1day, 1week, 1month, 1year, never]
+              default: 1week
+    CreateResponse:
+      type: object
+      properties:
+        status: { type: integer, enum: [0] }
+        id: { type: string, example: 0123456789abcdef }
+        url: { type: string, example: "?0123456789abcdef" }
+        deletetoken: { type: string }
+    PasteResponse:
+      type: object
+      properties:
+        status: { type: integer, enum: [0] }
+        id: { type: string }
+        url: { type: string }
+        v: { type: integer, enum: [2] }
+        adata: { $ref: "#/components/schemas/AData" }
+        ct: { type: string }
+        meta:
+          type: object
+          properties:
+            created: { type: integer, format: int64 }
+            time_to_live: { type: integer, format: int64, description: Seconds left; absent for never. }
+        comments: { type: array, items: {} }
+        comment_count: { type: integer }
+        comment_offset: { type: integer }
+        "@context": { type: string }
+    DeleteResponse:
+      type: object
+      properties:
+        status: { type: integer, enum: [0] }
+        id: { type: string }
+        url: { type: string }
+    Error:
+      type: object
+      properties:
+        status: { type: integer, enum: [1] }
+        message: { type: string, example: "Paste does not exist, has expired or has been deleted." }
