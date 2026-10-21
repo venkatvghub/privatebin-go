@@ -1,95 +1,79 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
-	"strconv"
+	"strings"
 
+	"github.com/caarlos0/env/v11"
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	AppName     string
-	TablePrefix string // PrivateBin "tbl" option
-	DeleteSalt  string // HMAC key for delete tokens; share with PrivateBin to honour its tokens
-	LogLevel    string
-	MetricsAddr string // empty disables metrics
+	AppName     string `env:"APP_NAME,notEmpty"`
+	LogLevel    string `env:"LOG_LEVEL" envDefault:"info"`
+	MetricsAddr string `env:"METRICS_ADDR" envDefault:":9090"` // empty disables metrics
 
-	DatabaseURL    string
-	ListenAddr     string
-	BaseURL        string
-	MaxPasteBytes  int64
-	CookieSecure   bool
-	SwaggerEnabled bool
+	DatabaseURL string `env:"DATABASE_URL,notEmpty"`
+	// TablePrefix is PrivateBin's "tbl" option. It is spliced into DDL, so it is
+	// validated to plain identifier characters.
+	TablePrefix string `env:"TABLE_PREFIX"`
+	// DeleteSalt keys the delete tokens; set equal to PrivateBin's server salt to
+	// honour tokens it issued.
+	DeleteSalt string `env:"DELETE_SALT,notEmpty"`
 
-	AuthEnabled      bool
-	OIDCIssuer       string
-	OIDCClientID     string
-	OIDCClientSecret string
-	SessionSecret    string
+	ListenAddr    string `env:"LISTEN_ADDR" envDefault:":8080"`
+	BaseURL       string `env:"BASE_URL" envDefault:"http://localhost:8080"`
+	MaxPasteBytes int64  `env:"MAX_PASTE_BYTES" envDefault:"2097152"`
+	// TrustedProxies lists proxies whose X-Forwarded-For is believed; empty means
+	// the client IP is the TCP peer (so the per-IP rate limit cannot be spoofed).
+	TrustedProxies []string `env:"TRUSTED_PROXIES" envSeparator:","`
+	SwaggerEnabled bool     `env:"SWAGGER_ENABLED" envDefault:"true"`
+
+	AuthEnabled      bool   `env:"AUTH_ENABLED"`
+	OIDCIssuer       string `env:"OIDC_ISSUER"`
+	OIDCClientID     string `env:"OIDC_CLIENT_ID"`
+	OIDCClientSecret string `env:"OIDC_CLIENT_SECRET"`
+	SessionSecret    string `env:"SESSION_SECRET"`
 }
 
-var identRe = regexp.MustCompile(`[^A-Za-z0-9_]+`)
+const minSecretLen = 32
 
-// Load reads .env (if present; real env vars win) then the environment.
+var prefixRe = regexp.MustCompile(`^[A-Za-z0-9_]*$`)
+
+// Load reads .env (if present; real environment variables win), parses the
+// environment and validates the result.
 func Load() (*Config, error) {
-	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("load .env: %w", err)
 	}
-	c := &Config{
-		AppName:          os.Getenv("APP_NAME"),
-		TablePrefix:      os.Getenv("TABLE_PREFIX"),
-		DeleteSalt:       os.Getenv("DELETE_SALT"),
-		LogLevel:         env("LOG_LEVEL", "info"),
-		MetricsAddr:      env("METRICS_ADDR", ":9090"),
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
-		ListenAddr:       env("LISTEN_ADDR", ":8080"),
-		BaseURL:          env("BASE_URL", "http://localhost:8080"),
-		MaxPasteBytes:    envInt("MAX_PASTE_BYTES", 2<<20),
-		CookieSecure:     envBool("COOKIE_SECURE", false),
-		SwaggerEnabled:   envBool("SWAGGER_ENABLED", true),
-		AuthEnabled:      envBool("AUTH_ENABLED", false),
-		OIDCIssuer:       os.Getenv("OIDC_ISSUER"),
-		OIDCClientID:     os.Getenv("OIDC_CLIENT_ID"),
-		OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"),
-		SessionSecret:    os.Getenv("SESSION_SECRET"),
+	var c Config
+	if err := env.Parse(&c); err != nil {
+		return nil, err
 	}
-	c.TablePrefix = identRe.ReplaceAllString(c.TablePrefix, "")
-	if c.AppName == "" {
-		return nil, fmt.Errorf("APP_NAME required")
+	return &c, c.validate()
+}
+
+// isPlaceholder spots secrets copied unchanged from .env.example.
+func isPlaceholder(s string) bool { return strings.Contains(s, "change-me") }
+
+func (c *Config) validate() error {
+	var errs []error
+	if !prefixRe.MatchString(c.TablePrefix) {
+		errs = append(errs, errors.New("TABLE_PREFIX may only contain letters, digits and underscores"))
 	}
-	if len(c.DeleteSalt) < 32 {
-		return nil, fmt.Errorf("DELETE_SALT required (>=32 chars)")
-	}
-	if c.DatabaseURL == "" {
-		return nil, fmt.Errorf("DATABASE_URL required")
+	if len(c.DeleteSalt) < minSecretLen || isPlaceholder(c.DeleteSalt) {
+		errs = append(errs, fmt.Errorf("DELETE_SALT must be a random value of at least %d characters (not the .env.example placeholder)", minSecretLen))
 	}
 	if c.AuthEnabled {
-		if c.OIDCIssuer == "" || c.OIDCClientID == "" || len(c.SessionSecret) < 32 {
-			return nil, fmt.Errorf("AUTH_ENABLED needs OIDC_ISSUER, OIDC_CLIENT_ID, SESSION_SECRET (>=32 chars)")
+		if c.OIDCIssuer == "" || c.OIDCClientID == "" {
+			errs = append(errs, errors.New("AUTH_ENABLED needs OIDC_ISSUER and OIDC_CLIENT_ID"))
+		}
+		if len(c.SessionSecret) < minSecretLen || isPlaceholder(c.SessionSecret) {
+			errs = append(errs, fmt.Errorf("SESSION_SECRET must be at least %d characters", minSecretLen))
 		}
 	}
-	return c, nil
-}
-
-func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-func envInt(k string, def int64) int64 {
-	if v, err := strconv.ParseInt(os.Getenv(k), 10, 64); err == nil {
-		return v
-	}
-	return def
-}
-
-func envBool(k string, def bool) bool {
-	if v, err := strconv.ParseBool(os.Getenv(k)); err == nil {
-		return v
-	}
-	return def
+	return errors.Join(errs...)
 }

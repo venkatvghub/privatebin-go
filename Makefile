@@ -1,4 +1,4 @@
-.PHONY: run test lint deadcode up
+.PHONY: run test lint deadcode audit up
 run:
 	go run ./cmd/privatebin-go
 test:
@@ -9,3 +9,6 @@ deadcode:
 	go run golang.org/x/tools/cmd/deadcode@latest ./...
 up:
 	docker compose up -d --build
+audit:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	go run github.com/securego/gosec/v2/cmd/gosec@latest -quiet ./...

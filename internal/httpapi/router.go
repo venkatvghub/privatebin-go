@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,7 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/venkatvghub/privatebin-go/internal/auth"
 	"github.com/venkatvghub/privatebin-go/internal/config"
-	"github.com/venkatvghub/privatebin-go/internal/model"
 	"github.com/venkatvghub/privatebin-go/internal/obs"
 	"github.com/venkatvghub/privatebin-go/internal/paste"
 	"go.uber.org/zap"
@@ -41,11 +39,14 @@ var idRe = regexp.MustCompile(`^[a-f0-9]{16}$`)
 const (
 	msgNotFound   = "Paste does not exist, has expired or has been deleted."
 	msgInvalid    = "Invalid data."
-	msgWrongToken = "Wrong deletion token. Paste was not deleted."
+	msgWrongToken = "Wrong deletion token. Paste was not deleted." // #nosec G101 -- PrivateBin message text, not a credential
 )
 
 func NewRouter(d Deps) *gin.Engine {
 	r := gin.New()
+	if err := r.SetTrustedProxies(d.Cfg.TrustedProxies); err != nil {
+		panic(err) // misconfigured TRUSTED_PROXIES; fail at startup
+	}
 	r.Use(recoverer(d.Log), observe(d.Log, d.Metrics), securityHeaders())
 
 	r.GET("/healthz", func(c *gin.Context) {
@@ -91,12 +92,12 @@ func NewRouter(d Deps) *gin.Engine {
 		})
 	})
 	r.GET("/api/paste/:id/meta", func(c *gin.Context) {
-		p, err := d.Paste.Peek(c.Param("id"))
+		burn, err := d.Paste.IsBurn(c.Param("id"))
 		if err != nil {
-			fail(c, msgNotFound)
+			d.readError(c, err)
 			return
 		}
-		c.JSON(200, gin.H{"status": 0, "burn": p.Burn()})
+		c.JSON(200, gin.H{"status": 0, "burn": burn})
 	})
 
 	if d.Cfg.SwaggerEnabled {
@@ -112,6 +113,9 @@ func NewRouter(d Deps) *gin.Engine {
 		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
 			c.Status(http.StatusNotFound)
 			return
+		}
+		if _, err := fs.Stat(d.Static, strings.TrimPrefix(path.Clean(c.Request.URL.Path), "/")); err == nil {
+			setStaticCache(c)
 		}
 		files.ServeHTTP(c.Writer, c.Request)
 	})
@@ -159,29 +163,21 @@ func (d Deps) jsonGet(c *gin.Context) {
 		d.jsonDelete(c, id, tok)
 		return
 	}
-	p, err := d.Paste.Peek(id)
+	v, err := d.Paste.Read(id)
 	if err != nil {
 		d.readError(c, err)
 		return
 	}
-	var m map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(p.Data), &m)
-	if model.BurnFlag(m["adata"]) {
-		// Returned and destroyed in one atomic step; losers of a race get not-found.
-		if _, err = d.Paste.Take(id); err != nil {
-			d.readError(c, err)
-			return
-		}
+	if v.Burned {
 		d.Metrics.PastesBurned.Inc()
 	}
-	meta := gin.H{"created": p.Created()}
-	if p.ExpireDate > 0 {
-		meta["time_to_live"] = max(p.ExpireDate-time.Now().Unix(), 0)
+	meta := gin.H{"created": v.Created}
+	if v.TimeToLive != nil {
+		meta["time_to_live"] = *v.TimeToLive
 	}
-	delete(m, "meta")
 	c.Header("Cache-Control", "no-store")
 	c.JSON(200, gin.H{
-		"status": 0, "id": id, "url": "?" + id, "v": m["v"], "adata": m["adata"], "ct": m["ct"],
+		"status": 0, "id": id, "url": "?" + id, "v": v.Stored.V, "adata": v.Stored.AData, "ct": v.Stored.CT,
 		"meta": meta, "comments": []any{}, "comment_count": 0, "comment_offset": 0,
 		"@context": "?jsonld=paste",
 	})
@@ -213,23 +209,17 @@ func (d Deps) jsonPost(c *gin.Context) {
 		fail(c, "Discussions are disabled.")
 		return
 	}
-	burn, err := in.Validate()
-	if err != nil {
+	id, tok, burn, err := d.Paste.Create(&in)
+	switch {
+	case errors.Is(err, paste.ErrInvalid):
 		fail(c, msgInvalid)
-		return
-	}
-	exp, ok := paste.Expiries[in.Meta.Expire]
-	if !ok {
-		exp = paste.Expiries["1week"]
-	}
-	stored, _ := json.Marshal(gin.H{"v": 2, "adata": in.AData, "ct": in.CT})
-	id, tok, err := d.Paste.Create(string(stored), exp)
-	if err != nil {
+	case err != nil:
 		d.serverError(c, "create paste", err)
-		return
+	default:
+		d.Metrics.PastesCreated.WithLabelValues(strconv.FormatBool(burn)).Inc()
+		c.Header("Cache-Control", "no-store") // response carries the delete token
+		c.JSON(200, gin.H{"status": 0, "id": id, "url": "?" + id, "deletetoken": tok})
 	}
-	d.Metrics.PastesCreated.WithLabelValues(strconv.FormatBool(burn)).Inc()
-	c.JSON(200, gin.H{"status": 0, "id": id, "url": "?" + id, "deletetoken": tok})
 }
 
 // readError maps service errors to PrivateBin responses.

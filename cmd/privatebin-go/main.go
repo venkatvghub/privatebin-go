@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	stdlog "log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,7 +41,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	db, err := gorm.Open(postgres.Open(cfg.DatabaseURL), &gorm.Config{Logger: logger.Default.LogMode(logger.Warn), NamingStrategy: paste.NamingStrategy(cfg.TablePrefix)})
+	db, err := gorm.Open(postgres.Open(cfg.DatabaseURL), &gorm.Config{Logger: logger.New(stdlog.New(os.Stderr, "", stdlog.LstdFlags), logger.Config{LogLevel: logger.Warn, IgnoreRecordNotFoundError: true}), NamingStrategy: paste.NamingStrategy(cfg.TablePrefix)})
 	if err != nil {
 		log.Fatal("db open", zap.Error(err))
 	}
@@ -67,6 +68,9 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, Metrics: m, Cfg: cfg, Paste: svc, DB: db, Auth: a, Static: web.FS()}),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 	if cfg.MetricsAddr != "" {
 		go serve(ctx, log, &http.Server{Addr: cfg.MetricsAddr, Handler: m.Handler(), ReadHeaderTimeout: 10 * time.Second})
@@ -79,7 +83,8 @@ func main() {
 func serve(ctx context.Context, log *zap.Logger, srv *http.Server) {
 	go func() {
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// ctx is already cancelled here, so shutdown needs its own deadline.
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second) // #nosec G118
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()

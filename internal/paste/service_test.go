@@ -33,7 +33,7 @@ const burnData = `{"v":2,"adata":[["AAAAAAAAAAAAAAAA","AAAAAAAAAAA=",100000,256,
 
 func TestTakeIsAtomic(t *testing.T) {
 	s := testService(t)
-	id, _, err := s.Create(burnData, time.Hour)
+	id, _, err := s.insert(burnData, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,22 +56,22 @@ func TestTakeIsAtomic(t *testing.T) {
 
 func TestDeleteTokenAndExpiry(t *testing.T) {
 	s := testService(t)
-	id, tok, _ := s.Create(burnData, time.Hour)
+	id, tok, _ := s.insert(burnData, time.Hour)
 	if err := s.Delete(id, "nope"); !errors.Is(err, ErrWrongToken) {
 		t.Fatalf("want ErrWrongToken, got %v", err)
 	}
 	if err := s.Delete(id, tok); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Peek(id); !errors.Is(err, ErrNotFound) {
+	if _, err := s.peek(id); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 
-	id, _, _ = s.Create(burnData, time.Hour)
+	id, _, _ = s.insert(burnData, time.Hour)
 	if err := s.db.Exec(`UPDATE paste SET expiredate = 1 WHERE dataid = ?`, id).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Peek(id); !errors.Is(err, ErrNotFound) {
+	if _, err := s.peek(id); !errors.Is(err, ErrNotFound) {
 		t.Fatal("expired paste must not be readable")
 	}
 	if n, err := s.PurgeExpired(); err != nil || n < 1 {

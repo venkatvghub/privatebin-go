@@ -4,7 +4,7 @@
 // The random key lives only in the URL fragment (base58).
 "use strict";
 (function () {
-  const ITERATIONS = 100000, KEY_BYTES = 32, TAG_BITS = 128, IV_BYTES = 12, SALT_BYTES = 8;
+  const ITERATIONS = 600000, KEY_BYTES = 32, TAG_BITS = 128, IV_BYTES = 12, SALT_BYTES = 8;
   const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
   const enc = new TextEncoder(), dec = new TextDecoder();
 

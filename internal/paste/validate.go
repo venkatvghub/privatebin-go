@@ -8,6 +8,9 @@ import (
 	"github.com/venkatvghub/privatebin-go/internal/model"
 )
 
+// maxIterations bounds the PBKDF2 cost a paste may demand from its readers.
+const maxIterations = 2_000_000
+
 var ErrInvalid = errors.New("invalid data")
 
 var formats = map[string]bool{"plaintext": true, "syntaxhighlighting": true, "markdown": true}
@@ -53,7 +56,7 @@ func (in *Input) Validate() (burn bool, err error) {
 		json.Unmarshal(cp[6], &mode) != nil || json.Unmarshal(cp[7], &comp) != nil {
 		return false, ErrInvalid
 	}
-	if !b64Len(iv, 12) || !b64Len(salt, 8) || iter < 1 || iter > 10_000_000 ||
+	if !b64Len(iv, 12) || !b64Len(salt, 8) || iter < 1 || iter > maxIterations ||
 		(keySize != 128 && keySize != 192 && keySize != 256) ||
 		(tagSize != 64 && tagSize != 96 && tagSize != 128) ||
 		algo != "aes" || mode != "gcm" || (comp != "none" && comp != "zlib") {

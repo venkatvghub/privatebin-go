@@ -4,18 +4,14 @@ package auth
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/securecookie"
 	"github.com/venkatvghub/privatebin-go/internal/config"
 	"golang.org/x/oauth2"
 )
@@ -24,12 +20,18 @@ const (
 	sessionCookie = "pbgo_session"
 	flowCookie    = "pbgo_oidc"
 	sessionTTL    = 12 * time.Hour
+	flowTTL       = 10 * time.Minute
 )
+
+// flow is the login state kept in a short-lived signed cookie.
+type flow struct{ State, Nonce, Verifier string }
 
 type Auth struct {
 	cfg      *config.Config
 	oauth    oauth2.Config
 	verifier *oidc.IDTokenVerifier
+	session  *securecookie.SecureCookie // signed, expiring "logged in" marker
+	flow     *securecookie.SecureCookie // signed, expiring login state
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Auth, error) {
@@ -39,8 +41,11 @@ func New(ctx context.Context, cfg *config.Config) (*Auth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("oidc discovery: %w", err)
 	}
+	key := []byte(cfg.SessionSecret)
 	return &Auth{
-		cfg: cfg,
+		cfg:     cfg,
+		session: securecookie.New(key, nil).MaxAge(int(sessionTTL.Seconds())),
+		flow:    securecookie.New(key, nil).MaxAge(int(flowTTL.Seconds())),
 		oauth: oauth2.Config{
 			ClientID:     cfg.OIDCClientID,
 			ClientSecret: cfg.OIDCClientSecret,
@@ -52,34 +57,11 @@ func New(ctx context.Context, cfg *config.Config) (*Auth, error) {
 	}, nil
 }
 
-func (a *Auth) sign(v string) string {
-	m := hmac.New(sha256.New, []byte(a.cfg.SessionSecret))
-	m.Write([]byte(v))
-	return v + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil))
-}
-
-func (a *Auth) unsign(s string) (string, bool) {
-	i := strings.LastIndexByte(s, '.')
-	if i < 0 {
-		return "", false
-	}
-	if !hmac.Equal([]byte(a.sign(s[:i])), []byte(s)) {
-		return "", false
-	}
-	return s[:i], true
-}
-
 func (a *Auth) setCookie(c *gin.Context, name, val string, ttl time.Duration) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name: name, Value: val, Path: "/", MaxAge: int(ttl.Seconds()),
-		HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: strings.HasPrefix(a.cfg.BaseURL, "https://"), SameSite: http.SameSiteLaxMode,
 	})
-}
-
-func rnd() string {
-	b := make([]byte, 24)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // LoggedIn reports whether the request carries a valid session.
@@ -88,12 +70,8 @@ func (a *Auth) LoggedIn(c *gin.Context) bool {
 	if err != nil {
 		return false
 	}
-	v, ok := a.unsign(ck)
-	if !ok {
-		return false
-	}
-	exp, err := strconv.ParseInt(v, 10, 64)
-	return err == nil && time.Now().Unix() < exp
+	var v string
+	return a.session.Decode(sessionCookie, ck, &v) == nil && v == "1"
 }
 
 // Require rejects requests without a valid session.
@@ -117,32 +95,40 @@ func (a *Auth) Routes(r gin.IRoutes) {
 }
 
 func (a *Auth) login(c *gin.Context) {
-	state, nonce, verifier := rnd(), rnd(), oauth2.GenerateVerifier()
-	a.setCookie(c, flowCookie, a.sign(state+"|"+nonce+"|"+verifier), 10*time.Minute)
-	c.Redirect(http.StatusFound, a.oauth.AuthCodeURL(state,
-		oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)))
+	f := flow{State: oauth2.GenerateVerifier(), Nonce: oauth2.GenerateVerifier(), Verifier: oauth2.GenerateVerifier()}
+	enc, err := a.flow.Encode(flowCookie, f)
+	if err != nil {
+		c.String(http.StatusInternalServerError, "login unavailable")
+		return
+	}
+	a.setCookie(c, flowCookie, enc, flowTTL)
+	c.Redirect(http.StatusFound, a.oauth.AuthCodeURL(f.State, oidc.Nonce(f.Nonce), oauth2.S256ChallengeOption(f.Verifier)))
 }
 
 func (a *Auth) callback(c *gin.Context) {
 	raw, _ := c.Cookie(flowCookie)
-	v, ok := a.unsign(raw)
-	parts := strings.Split(v, "|")
-	if !ok || len(parts) != 3 || c.Query("state") != parts[0] {
+	var f flow
+	if a.flow.Decode(flowCookie, raw, &f) != nil || c.Query("state") != f.State {
 		c.String(http.StatusBadRequest, "invalid login state")
 		return
 	}
-	tok, err := a.oauth.Exchange(c.Request.Context(), c.Query("code"), oauth2.VerifierOption(parts[2]))
+	tok, err := a.oauth.Exchange(c.Request.Context(), c.Query("code"), oauth2.VerifierOption(f.Verifier))
 	if err != nil {
 		c.String(http.StatusBadGateway, "token exchange failed")
 		return
 	}
 	rawID, _ := tok.Extra("id_token").(string)
 	id, err := a.verifier.Verify(c.Request.Context(), rawID)
-	if err != nil || id.Nonce != parts[1] {
+	if err != nil || id.Nonce != f.Nonce {
 		c.String(http.StatusUnauthorized, "invalid id token")
 		return
 	}
+	enc, err := a.session.Encode(sessionCookie, "1")
+	if err != nil {
+		c.String(http.StatusInternalServerError, "login unavailable")
+		return
+	}
 	a.setCookie(c, flowCookie, "", -time.Second)
-	a.setCookie(c, sessionCookie, a.sign(strconv.FormatInt(time.Now().Add(sessionTTL).Unix(), 10)), sessionTTL)
+	a.setCookie(c, sessionCookie, enc, sessionTTL)
 	c.Redirect(http.StatusFound, "/")
 }

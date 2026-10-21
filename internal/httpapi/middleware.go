@@ -25,6 +25,8 @@ func securityHeaders() gin.HandlerFunc {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), interest-cohort=()")
 		c.Next()
 	}
 }
@@ -45,28 +47,56 @@ func bodyLimit(n int64) gin.HandlerFunc {
 	}
 }
 
-// newLimiter is a per-IP token bucket (r tokens/sec, burst b).
+const (
+	limiterIdleTTL  = 10 * time.Minute
+	limiterSweepLen = 1024 // sweep idle entries once the map grows past this
+)
+
+type visitor struct {
+	lim  *rate.Limiter
+	seen time.Time
+}
+
+// newLimiter is a per-IP token bucket (r tokens/sec, burst b). Idle entries are
+// evicted individually so active clients never get a fresh burst.
 func newLimiter(r rate.Limit, b int) gin.HandlerFunc {
 	var mu sync.Mutex
-	m := map[string]*rate.Limiter{}
+	m := map[string]*visitor{}
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
+		ip, now := c.ClientIP(), time.Now()
 		mu.Lock()
-		l, ok := m[ip]
-		if !ok {
-			if len(m) > 10000 {
-				m = map[string]*rate.Limiter{}
+		if len(m) > limiterSweepLen {
+			for k, v := range m {
+				if now.Sub(v.seen) > limiterIdleTTL {
+					delete(m, k)
+				}
 			}
-			l = rate.NewLimiter(r, b)
-			m[ip] = l
 		}
+		v, ok := m[ip]
+		if !ok {
+			v = &visitor{lim: rate.NewLimiter(r, b)}
+			m[ip] = v
+		}
+		v.seen = now
+		allowed := v.lim.Allow()
 		mu.Unlock()
-		if !l.Allow() {
+		if !allowed {
 			fail(c, "Please wait 1 seconds between each post.")
 			return
 		}
 		c.Next()
 	}
+}
+
+// setStaticCache lets browsers reuse an embedded asset. Assets carry no
+// validators, so expiry is time based: libraries for a day, our own files for
+// an hour.
+func setStaticCache(c *gin.Context) {
+	age := 3600
+	if strings.HasPrefix(c.Request.URL.Path, "/vendor/") {
+		age = 86400
+	}
+	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(age))
 }
 
 // observe logs one JSON line per request and records metrics. It logs the
