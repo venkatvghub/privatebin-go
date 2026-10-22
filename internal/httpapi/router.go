@@ -92,7 +92,12 @@ func NewRouter(d Deps) *gin.Engine {
 		})
 	})
 	r.GET("/api/paste/:id/meta", func(c *gin.Context) {
-		burn, err := d.Paste.IsBurn(c.Param("id"))
+		id := c.Param("id")
+		if !idRe.MatchString(id) {
+			fail(c, msgInvalid)
+			return
+		}
+		burn, err := d.Paste.IsBurn(id)
 		if err != nil {
 			d.readError(c, err)
 			return

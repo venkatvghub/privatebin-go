@@ -111,6 +111,12 @@ func TestRejects(t *testing.T) {
 			t.Errorf("%s: %v", name, got)
 		}
 	}
+	// Every route taking a paste id validates its shape before touching the database.
+	for _, target := range []string{"/?not-an-id", "/?pasteid=short", "/api/paste/not-an-id/meta"} {
+		if got := do(h, "GET", target, "", target[:2] == "/?"); got["status"] != float64(1) || got["message"] != msgInvalid {
+			t.Errorf("%s: want %q, got %v", target, msgInvalid, got)
+		}
+	}
 	if got := do(h, "POST", "/", strings.Replace(reqBody, "%d", "0", 1), false); got["status"] != float64(1) {
 		t.Errorf("POST without JSON header must be rejected: %v", got)
 	}
