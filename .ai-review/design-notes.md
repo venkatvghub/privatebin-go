@@ -8,3 +8,4 @@ Deliberate behaviour the reviewer cannot see in a diff. Read from the base branc
 - **Reading a burn paste goes through `Service.Read` and `Take`.** `Take` is one atomic `DELETE ... RETURNING`; of concurrent readers exactly one wins. Covered by `TestTakeIsAtomic`. Flag if burn handling stops going through `Take`.
 - **Discussions are not supported.** The `comment` table exists for schema compatibility only; comment requests return `status: 1`.
 - **Client IP is the TCP peer unless `TRUSTED_PROXIES` is set.** Flag any use of `X-Forwarded-For` that bypasses `c.ClientIP()`.
+- **`/metrics` is served on the app port, unauthenticated, when `METRICS_ENABLED` is true (the default).** Operators restrict it at their proxy. It must expose only route templates, methods, status codes and counters. Flag if a metric label or value ever carries a paste id, token, IP or request content.

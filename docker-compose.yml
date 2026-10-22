@@ -1,5 +1,7 @@
 name: privatebin-go
 
+# Postgres only (plus Dex under the "auth" profile). The app itself runs on the host:
+# `make run` or `go run ./cmd/privatebin-go`.
 services:
   db:
     image: postgres:16-alpine
@@ -7,6 +9,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-privatebin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-privatebin}
       POSTGRES_DB: ${POSTGRES_DB:-privatebin}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -14,18 +18,6 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
-
-  app:
-    build: .
-    env_file: .env
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-privatebin}:${POSTGRES_PASSWORD:-privatebin}@db:5432/${POSTGRES_DB:-privatebin}?sslmode=disable
-    ports:
-      - "8080:8080"
-      - "127.0.0.1:9090:9090"
-    depends_on:
-      db:
-        condition: service_healthy
 
   dex:
     profiles: ["auth"]

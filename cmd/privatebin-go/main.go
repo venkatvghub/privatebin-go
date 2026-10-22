@@ -72,10 +72,7 @@ func main() {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	if cfg.MetricsAddr != "" {
-		go serve(ctx, log, &http.Server{Addr: cfg.MetricsAddr, Handler: m.Handler(), ReadHeaderTimeout: 10 * time.Second})
-	}
-	log.Info("listening", zap.String("addr", cfg.ListenAddr), zap.Bool("auth", cfg.AuthEnabled), zap.String("metrics", cfg.MetricsAddr))
+	log.Info("listening", zap.String("addr", cfg.ListenAddr), zap.Bool("auth", cfg.AuthEnabled), zap.Bool("metrics", cfg.MetricsEnabled))
 	serve(ctx, log, srv)
 }
 

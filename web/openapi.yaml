@@ -102,6 +102,16 @@ paths:
                       status: { type: integer, enum: [0] }
                       burn: { type: boolean }
                   - $ref: "#/components/schemas/Error"
+  /metrics:
+    get:
+      summary: Prometheus metrics (privatebin-go extension; served only when METRICS_ENABLED is true)
+      operationId: metrics
+      responses:
+        "200":
+          description: Metrics in the Prometheus text exposition format
+          content:
+            text/plain:
+              schema: { type: string }
   /healthz:
     get:
       summary: Liveness and database check

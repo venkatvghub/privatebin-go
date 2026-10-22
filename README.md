@@ -25,17 +25,26 @@ Paste id, ciphertext size, creation and expiry time, whether it is burn-after-re
 
 ## Quick start
 
+The database runs in Docker; the app runs on your machine.
+
 ```bash
-cp .env.example .env        # edit DELETE_SALT (32+ chars) at least
-docker compose up -d --build
+cp .env.example .env                     # then set DELETE_SALT: openssl rand -hex 32
+docker compose up -d --wait db           # Postgres 16 on 127.0.0.1:5432 (make db)
+go run ./cmd/privatebin-go               # reads .env from the current directory (make run)
 ```
 
 - App and UI: http://localhost:8080
 - Swagger UI: http://localhost:8080/swagger/
-- Metrics: http://localhost:9090/metrics
+- Metrics: http://localhost:8080/metrics
 - Health: http://localhost:8080/healthz
 
-`docker compose` runs two containers: `app` (frontend and backend in one image) and `db` (Postgres 16). Optional login adds Dex: `docker compose --profile auth up -d --build` with `AUTH_ENABLED=true` (dev user `dev@example.com` / `password`, see `dex/config.yaml`).
+The app creates its tables on start. It refuses to start without `APP_NAME`, `DATABASE_URL` and a real `DELETE_SALT` (32+ random characters, not the placeholder).
+
+**Port 5432 already in use?** Set `POSTGRES_PORT=5433` and change the port in `DATABASE_URL` to match, then run `docker compose up -d --wait db` again.
+
+**Without Docker at all:** point `DATABASE_URL` at any PostgreSQL 12+ you have (`postgres://user:pass@host:5432/dbname?sslmode=disable`). The database and user must already exist; nothing else is needed.
+
+**Optional login (Dex):** `docker compose --profile auth up -d --wait` starts Dex too. Set `AUTH_ENABLED=true` and the `OIDC_*` and `SESSION_SECRET` values in `.env` (dev user `dev@example.com` / `password`, see `dex/config.yaml`).
 
 ## Configuration
 
@@ -47,7 +56,7 @@ Read from environment variables; a `.env` file (gitignored) is loaded if present
 | `DATABASE_URL` | required | Postgres DSN |
 | `DELETE_SALT` | required, 32+ chars | HMAC key for delete tokens; set equal to PrivateBin's server salt to honour its tokens |
 | `LISTEN_ADDR` | `:8080` | HTTP listen address |
-| `METRICS_ADDR` | `:9090` | Prometheus listener; empty disables |
+| `METRICS_ENABLED` | `true` | serve Prometheus metrics at `/metrics` on the app port. The endpoint is unauthenticated, so block it at your reverse proxy or set `false` if the port is public |
 | `LOG_LEVEL` | `info` | zap level |
 | `BASE_URL` | `http://localhost:8080` | used for the OIDC redirect |
 | `MAX_PASTE_BYTES` | `2097152` | request body limit |
@@ -87,25 +96,31 @@ Checked against the OWASP Top 10 (2021); see `SECURITY.md` for the review and ho
 
 ## Building
 
-Requires Go (see `go.mod`) and Docker. Generate secrets with `openssl rand -hex 32`; the app refuses to start with the `.env.example` placeholders.
+Requires Go (see `go.mod`). Docker is only needed for the database, the optional image and Dex. Generate secrets with `openssl rand -hex 32`; the app refuses to start with the `.env.example` placeholders.
 
 ```bash
-go build -o privatebin-go ./cmd/privatebin-go     # needs DATABASE_URL, APP_NAME, DELETE_SALT
-make run                               # go run ./cmd/privatebin-go
-docker build -t privatebin-go .              # Chainguard go -> Chainguard static, non-root
+go build -o privatebin-go ./cmd/privatebin-go    # needs APP_NAME, DATABASE_URL, DELETE_SALT in the environment or .env
+make run                                         # go run ./cmd/privatebin-go
+```
+
+**Container image** (frontend and backend in one image; Chainguard `go` build stage, Chainguard `static` final stage, non-root):
+
+```bash
+docker build -t privatebin-go .
+docker run --rm -p 8080:8080 --env-file .env \
+  -e DATABASE_URL='postgres://privatebin:privatebin@host.docker.internal:5432/privatebin?sslmode=disable' \
+  privatebin-go
 ```
 
 ## Testing
 
 ```bash
+docker compose up -d --wait db           # the database tests need it
+export TEST_DATABASE_URL='postgres://privatebin:privatebin@localhost:5432/privatebin?sslmode=disable'
 go vet ./...
-go test ./...                          # DB tests skip locally without TEST_DATABASE_URL and fail when CI is set
-# with the compose database (port is not published; run inside the network):
-docker run --rm --network privatebin-go_default -v "$PWD":/src -w /src \
-  -e TEST_DATABASE_URL='postgres://privatebin:privatebin@db:5432/privatebin?sslmode=disable' \
-  cgr.dev/chainguard/go:latest test ./...
-make deadcode                          # golang.org/x/tools deadcode
-make audit                             # govulncheck + gosec
+go test -race ./...                      # DB tests skip without TEST_DATABASE_URL and fail when CI is set
+make deadcode                            # golang.org/x/tools deadcode
+make audit                               # govulncheck + gosec
 ```
 
 ## Contributing
