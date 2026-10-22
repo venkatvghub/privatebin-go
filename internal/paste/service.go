@@ -60,20 +60,24 @@ func NamingStrategy(prefix string) schema.NamingStrategy {
 func New(db *gorm.DB, salt string) *Service { return &Service{db: db, salt: []byte(salt)} }
 
 // Migrate creates the PrivateBin 2.1.0 tables if absent, with the same DDL
-// PrivateBin uses on PostgreSQL. Existing tables are left untouched.
+// PrivateBin uses on PostgreSQL. Existing tables and indexes are left
+// untouched and, importantly, unlocked: CREATE INDEX IF NOT EXISTS takes a
+// SHARE lock on the table before it notices the index exists, which blocks
+// writers and can deadlock with a request holding a row lock.
 func (s *Service) Migrate(prefix string) error {
 	if !prefixRe.MatchString(prefix) {
 		return fmt.Errorf("invalid table prefix %q", prefix)
 	}
 	t := func(name string) string { return `"` + prefix + name + `"` }
-	stmts := []string{
+	tables := []string{
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s ("dataid" CHAR(16) NOT NULL PRIMARY KEY, "data" TEXT, "expiredate" INT, "meta" TEXT)`, t("paste")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s ("dataid" CHAR(16) NOT NULL PRIMARY KEY, "pasteid" CHAR(16), "parentid" CHAR(16), "data" TEXT, "vizhash" TEXT, "postdate" INT)`, t("comment")),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s ("pasteid")`, t("comment_parent"), t("comment")),
-		// Not in PrivateBin (which ignores it): keeps the purge scan cheap.
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s ("expiredate")`, t("paste_expiredate"), t("paste")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s ("id" CHAR(16) NOT NULL PRIMARY KEY, "value" TEXT)`, t("config")),
-		fmt.Sprintf(`INSERT INTO %s VALUES ('VERSION', '%s') ON CONFLICT DO NOTHING`, t("config"), SchemaVersion),
+	}
+	indexes := []struct{ name, table, column string }{
+		{"comment_parent", "comment", "pasteid"},
+		// Not in PrivateBin (which ignores it): keeps the purge scan cheap.
+		{"paste_expiredate", "paste", "expiredate"},
 	}
 	// CREATE ... IF NOT EXISTS is not safe against concurrent runs (two replicas,
 	// or parallel test packages), so serialise migrations with an advisory lock.
@@ -81,12 +85,25 @@ func (s *Service) Migrate(prefix string) error {
 		if err := tx.Exec(`SELECT pg_advisory_xact_lock(?)`, migrateLockID).Error; err != nil {
 			return err
 		}
-		for _, q := range stmts {
+		for _, q := range tables {
 			if err := tx.Exec(q).Error; err != nil {
 				return err
 			}
 		}
-		return nil
+		for _, ix := range indexes {
+			var exists bool
+			if err := tx.Raw(`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ?)`,
+				prefix+ix.name).Scan(&exists).Error; err != nil {
+				return err
+			}
+			if exists {
+				continue
+			}
+			if err := tx.Exec(fmt.Sprintf(`CREATE INDEX %s ON %s (%q)`, t(ix.name), t(ix.table), ix.column)).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Exec(fmt.Sprintf(`INSERT INTO %s VALUES ('VERSION', '%s') ON CONFLICT DO NOTHING`, t("config"), SchemaVersion)).Error
 	})
 }
 

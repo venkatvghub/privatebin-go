@@ -1,6 +1,7 @@
 package paste
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -72,5 +73,21 @@ func TestDeleteTokenAndExpiry(t *testing.T) {
 	}
 	if n, err := s.PurgeExpired(); err != nil || n < 1 {
 		t.Fatalf("purge: n=%d err=%v", n, err)
+	}
+}
+
+// Migrate runs at every start. While a request holds a row lock (a burn read
+// does), it must neither block nor deadlock against it.
+func TestMigrateDoesNotLockExistingTables(t *testing.T) {
+	s := testService(t)
+	tx := s.db.Begin()
+	defer tx.Rollback()
+	if err := tx.Exec(`LOCK TABLE paste IN ROW EXCLUSIVE MODE`).Error; err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := New(s.db.WithContext(ctx), "0123456789abcdef0123456789abcdef").Migrate(""); err != nil {
+		t.Fatalf("Migrate blocked on a held row lock: %v", err)
 	}
 }
