@@ -13,7 +13,7 @@ import (
 	"io/fs"
 )
 
-//go:embed index.html.tmpl openapi.yaml css js img i18n vendor swagger manifest.json browserconfig.xml robots.txt
+//go:embed PRIVATEBIN_FILES.sha256 index.html.tmpl openapi.yaml css js img i18n vendor swagger manifest.json browserconfig.xml robots.txt
 var content embed.FS
 
 // Version is the PrivateBin release the front end is copied from; it is the

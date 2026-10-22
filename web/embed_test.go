@@ -1,6 +1,9 @@
 package web
 
 import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"io/fs"
 	"regexp"
 	"strings"
@@ -74,6 +77,50 @@ func TestSyntaxThemesAreShipped(t *testing.T) {
 	for _, name := range SyntaxThemes {
 		if _, err := fs.Stat(content, "css/prettify/"+name+".css"); err != nil {
 			t.Errorf("theme %s: %v", name, err)
+		}
+	}
+}
+
+// The copied interface files must stay byte-for-byte what was imported (see
+// PROVENANCE.md): every recorded SHA-256 must match the embedded file.
+func TestCopiedFilesMatchRecordedSums(t *testing.T) {
+	for _, list := range []struct{ file, dir string }{
+		{"PRIVATEBIN_FILES.sha256", ""},
+		{"vendor/CHECKSUMS.txt", "vendor/"},
+	} {
+		f, err := content.Open(list.file)
+		if err != nil {
+			t.Fatalf("%s is not embedded: %v", list.file, err)
+		}
+		sc, checked := bufio.NewScanner(f), 0
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			sum, name, ok := strings.Cut(line, "  ")
+			if !ok {
+				t.Fatalf("%s: malformed line %q", list.file, line)
+			}
+			b, err := fs.ReadFile(content, list.dir+name)
+			if err != nil {
+				t.Errorf("%s lists %s, which is missing: %v", list.file, name, err)
+				continue
+			}
+			if got := sha256.Sum256(b); hex.EncodeToString(got[:]) != sum {
+				t.Errorf("%s changed: the copied files must stay unmodified", list.dir+name)
+			}
+			checked++
+		}
+		f.Close()
+		if checked < 2 {
+			t.Errorf("%s: only %d files checked", list.file, checked)
+		}
+	}
+	for _, must := range []string{"js/privatebin.js", "js/legacy.js", "js/bootstrap-5.3.8.js", "js/prettify.js", "js/kjua-0.10.0.js"} {
+		b, _ := fs.ReadFile(content, "PRIVATEBIN_FILES.sha256")
+		if !strings.Contains(string(b), "  "+must) {
+			t.Errorf("%s is not covered by PRIVATEBIN_FILES.sha256", must)
 		}
 	}
 }
