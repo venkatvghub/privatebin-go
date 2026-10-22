@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -103,7 +104,7 @@ func newLimiter(r rate.Limit, b int) gin.HandlerFunc {
 	l := &ipLimiter{m: map[string]*visitor{}, rate: r, burst: b}
 	return func(c *gin.Context) {
 		if !l.allow(c.ClientIP(), time.Now()) {
-			fail(c, "Please wait 1 seconds between each post.")
+			fail(c, fmt.Sprintf(msgRateLimitFmt, 1))
 			return
 		}
 		c.Next()

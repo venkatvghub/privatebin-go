@@ -43,11 +43,15 @@ var idRe = regexp.MustCompile(`^[a-f0-9]{16}$`)
 // "Paste" of older releases: lib/Controller.php GENERIC_ERROR, "Document is
 // limited to %s of encrypted data.", "Wrong deletion token. Document was not
 // deleted." and "Document was properly deleted."; the rate limit text is from
-// lib/Persistence/TrafficLimiter.php. TestMessagesMatchPrivateBin210 pins them.
+// lib/Persistence/TrafficLimiter.php. TestMessagesAreKnownToPrivateBin checks each
+// against the translation table PrivateBin ships, which is keyed by these exact strings.
 const (
-	msgNotFound   = "Document does not exist, has expired or has been deleted."
-	msgInvalid    = "Invalid data."
-	msgWrongToken = "Wrong deletion token. Document was not deleted." // #nosec G101 -- PrivateBin message text, not a credential
+	msgNotFound     = "Document does not exist, has expired or has been deleted."
+	msgInvalid      = "Invalid data."
+	msgWrongToken   = "Wrong deletion token. Document was not deleted." // #nosec G101 -- PrivateBin message text, not a credential
+	msgDeleted      = "Document was properly deleted."
+	msgSizeLimitFmt = "Document is limited to %s of encrypted data."
+	msgRateLimitFmt = "Please wait %d seconds between each post."
 )
 
 func NewRouter(d Deps) *gin.Engine {
@@ -187,7 +191,7 @@ func (d Deps) deletePage(c *gin.Context, id, tok string) {
 	page := d.Page
 	switch err := d.Paste.Delete(id, tok); {
 	case err == nil:
-		page.Status, page.Deleted = "Document was properly deleted.", true
+		page.Status, page.Deleted = msgDeleted, true
 	case errors.Is(err, paste.ErrWrongToken):
 		page.Error = msgWrongToken
 	case errors.Is(err, paste.ErrNotFound):
@@ -221,7 +225,7 @@ func (d Deps) jsonPost(c *gin.Context) {
 	if err := c.ShouldBindJSON(&in); err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
-			fail(c, fmt.Sprintf("Document is limited to %s of encrypted data.", humanSize(d.Cfg.MaxPasteBytes)))
+			fail(c, fmt.Sprintf(msgSizeLimitFmt, humanSize(d.Cfg.MaxPasteBytes)))
 			return
 		}
 		fail(c, msgInvalid)
