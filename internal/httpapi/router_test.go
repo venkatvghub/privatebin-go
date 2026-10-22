@@ -213,6 +213,14 @@ func TestDeleteLinkPage(t *testing.T) {
 		if rec.Code != 200 {
 			t.Fatalf("GET %s: %d", path, rec.Code)
 		}
+		// The URL of this page carries the delete token: it must not leak through
+		// Referer, nor be cached.
+		if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
+			t.Errorf("GET %s: Referrer-Policy %q, want no-referrer", path, got)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("GET %s: Cache-Control %q, want no-store", path, got)
+		}
 		return rec.Body.String()
 	}
 	created := do(h, "POST", "/", strings.Replace(reqBody, "%d", "0", 1), true)
