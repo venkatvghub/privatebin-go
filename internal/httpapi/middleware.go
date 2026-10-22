@@ -48,8 +48,9 @@ func bodyLimit(n int64) gin.HandlerFunc {
 }
 
 const (
-	limiterIdleTTL  = 10 * time.Minute
-	limiterSweepLen = 1024 // sweep idle entries once the map grows past this
+	limiterIdleTTL   = 10 * time.Minute
+	limiterSweepLen  = 1024 // start evicting idle entries once the map is this big
+	limiterSweepStep = 32   // entries examined per request, so the lock is held O(1)
 )
 
 type visitor struct {
@@ -57,30 +58,49 @@ type visitor struct {
 	seen time.Time
 }
 
-// newLimiter is a per-IP token bucket (r tokens/sec, burst b). Idle entries are
-// evicted individually so active clients never get a fresh burst.
+// ipLimiter is a per-IP token bucket (rate tokens/sec, burst b). Idle entries
+// are evicted individually, so active clients never get a fresh burst.
+type ipLimiter struct {
+	mu    sync.Mutex
+	m     map[string]*visitor
+	rate  rate.Limit
+	burst int
+}
+
+func (l *ipLimiter) allow(ip string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.m) > limiterSweepLen {
+		l.sweep(now)
+	}
+	v, ok := l.m[ip]
+	if !ok {
+		v = &visitor{lim: rate.NewLimiter(l.rate, l.burst)}
+		l.m[ip] = v
+	}
+	v.seen = now
+	return v.lim.Allow()
+}
+
+// sweep examines at most limiterSweepStep entries. Go starts map iteration at a
+// random entry, so repeated bounded sweeps reach every entry over time while a
+// single request never scans the whole map under the lock.
+func (l *ipLimiter) sweep(now time.Time) {
+	n := 0
+	for k, v := range l.m {
+		if now.Sub(v.seen) > limiterIdleTTL {
+			delete(l.m, k)
+		}
+		if n++; n >= limiterSweepStep {
+			return
+		}
+	}
+}
+
 func newLimiter(r rate.Limit, b int) gin.HandlerFunc {
-	var mu sync.Mutex
-	m := map[string]*visitor{}
+	l := &ipLimiter{m: map[string]*visitor{}, rate: r, burst: b}
 	return func(c *gin.Context) {
-		ip, now := c.ClientIP(), time.Now()
-		mu.Lock()
-		if len(m) > limiterSweepLen {
-			for k, v := range m {
-				if now.Sub(v.seen) > limiterIdleTTL {
-					delete(m, k)
-				}
-			}
-		}
-		v, ok := m[ip]
-		if !ok {
-			v = &visitor{lim: rate.NewLimiter(r, b)}
-			m[ip] = v
-		}
-		v.seen = now
-		allowed := v.lim.Allow()
-		mu.Unlock()
-		if !allowed {
+		if !l.allow(c.ClientIP(), time.Now()) {
 			fail(c, "Please wait 1 seconds between each post.")
 			return
 		}
