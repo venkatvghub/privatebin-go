@@ -132,7 +132,7 @@ make audit                               # govulncheck + gosec
 1. Fork and create a branch.
 2. Keep the PrivateBin wire format and SQL schema unchanged; do not add server-side features that need plaintext.
 3. Add or update tests; run `go vet ./...`, `go test ./...` and `make deadcode`.
-4. Frontend: no inline scripts or styles (the CSP forbids them), no CDN assets; vendored libraries live in `web/vendor/` with their own licences.
+4. Frontend: the interface files under `web/css`, `web/js`, `web/img` and `web/i18n` are PrivateBin 2.1.0's, unmodified: `go test ./web` verifies their sums and `web/PROVENANCE.md` records where each came from. Upgrade by re-copying a release, not by editing them. Our own page changes go in `web/index.html.tmpl` and `web/css/privatebin-go.css`; no inline script or styles (the CSP forbids them), no CDN assets.
 5. Update `web/openapi.yaml` when the API changes.
 6. Open a pull request describing the change and how you tested it.
 

@@ -7,7 +7,7 @@ https://github.com/PrivateBin/PrivateBin (tag `2.1.0`) and used here without cha
 `web/css`, `web/js`, `web/img` and `web/i18n`, plus `web/manifest.json`, `web/browserconfig.xml` and
 `web/robots.txt`. `web/index.html.tmpl` is a static rendering of PrivateBin's `tpl/bootstrap5.php`
 template with a fixed configuration (discussions and file uploads off). `web/PRIVATEBIN_FILES.sha256`
-lists the SHA-256 of every copied file so that it can be checked against the upstream release.
+lists the SHA-256 of every copied file; `web/PROVENANCE.md` names the upstream of each bundled library and `go test ./web` fails if a copied file changes.
 
 The PrivateBin JavaScript is the copyright of its authors (see PrivateBin's `CREDITS.md`) and is used
 under the Zlib/libpng license below. The libraries it bundles carry their own licenses, reproduced in
