@@ -2,23 +2,19 @@ package paste
 
 import (
 	"errors"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/venkatvghub/privatebin-go/internal/testdb"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 func testService(t *testing.T) *Service {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{NamingStrategy: NamingStrategy("")})
+	db, err := gorm.Open(postgres.Open(testdb.DSN(t)), &gorm.Config{NamingStrategy: NamingStrategy("")})
 	if err != nil {
 		t.Fatal(err)
 	}

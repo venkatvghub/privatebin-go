@@ -99,7 +99,7 @@ docker build -t privatebin-go .              # Chainguard go -> Chainguard stati
 
 ```bash
 go vet ./...
-go test ./...                          # DB tests skip unless TEST_DATABASE_URL is set
+go test ./...                          # DB tests skip locally without TEST_DATABASE_URL and fail when CI is set
 # with the compose database (port is not published; run inside the network):
 docker run --rm --network privatebin-go_default -v "$PWD":/src -w /src \
   -e TEST_DATABASE_URL='postgres://privatebin:privatebin@db:5432/privatebin?sslmode=disable' \

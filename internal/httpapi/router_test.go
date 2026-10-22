@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -12,6 +11,7 @@ import (
 	"github.com/venkatvghub/privatebin-go/internal/config"
 	"github.com/venkatvghub/privatebin-go/internal/obs"
 	"github.com/venkatvghub/privatebin-go/internal/paste"
+	"github.com/venkatvghub/privatebin-go/internal/testdb"
 	"go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -21,11 +21,7 @@ const reqBody = `{"v":2,"adata":[["AAAAAAAAAAAAAAAA","AAAAAAAAAAA=",100000,256,1
 
 func newTestRouter(t *testing.T) http.Handler {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{NamingStrategy: paste.NamingStrategy("")})
+	db, err := gorm.Open(postgres.Open(testdb.DSN(t)), &gorm.Config{NamingStrategy: paste.NamingStrategy("")})
 	if err != nil {
 		t.Fatal(err)
 	}
