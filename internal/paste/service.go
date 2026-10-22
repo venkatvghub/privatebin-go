@@ -116,7 +116,7 @@ func (s *Service) Create(in *Input) (id, token string, burn bool, err error) {
 	if !ok {
 		exp = Expiries["1week"]
 	}
-	data, _ := json.Marshal(stored{V: 2, AData: in.AData, CT: json.RawMessage(strconv.Quote(in.CT))})
+	data, _ := json.Marshal(stored{V: in.V, AData: in.AData, CT: json.RawMessage(strconv.Quote(in.CT))})
 	id, token, err = s.insert(string(data), exp)
 	return
 }
@@ -135,7 +135,7 @@ func (s *Service) insert(data string, expire time.Duration) (id, deleteToken str
 
 // stored is the JSON kept in paste.data.
 type stored struct {
-	V     int             `json:"v"`
+	V     float64         `json:"v"`
 	AData json.RawMessage `json:"adata"`
 	CT    json.RawMessage `json:"ct"`
 }
