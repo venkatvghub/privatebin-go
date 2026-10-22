@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/caarlos0/env/v11"
 	"github.com/joho/godotenv"
+	"github.com/venkatvghub/privatebin-go/web"
 )
 
 type Config struct {
@@ -32,6 +34,15 @@ type Config struct {
 	// the client IP is the TCP peer (so the per-IP rate limit cannot be spoofed).
 	TrustedProxies []string `env:"TRUSTED_PROXIES" envSeparator:","`
 	SwaggerEnabled bool     `env:"SWAGGER_ENABLED" envDefault:"true"`
+
+	// Page: the name in the title, nav and footer; operator text for the footer (HTML,
+	// e.g. a link); and an optional prettify theme for source code.
+	AppTitle    string `env:"APP_TITLE" envDefault:"privatebin-go"`
+	PageInfo    string `env:"PAGE_INFO"`
+	SyntaxTheme string `env:"SYNTAX_THEME"`
+	// BurnAfterReadingDefault preselects "Burn after reading" in the interface. Users
+	// can untick it per paste, because the flag is chosen (and authenticated) by the browser.
+	BurnAfterReadingDefault bool `env:"BURN_AFTER_READING_DEFAULT" envDefault:"true"`
 
 	AuthEnabled      bool   `env:"AUTH_ENABLED"`
 	OIDCIssuer       string `env:"OIDC_ISSUER"`
@@ -64,6 +75,9 @@ func (c *Config) validate() error {
 	var errs []error
 	if !prefixRe.MatchString(c.TablePrefix) {
 		errs = append(errs, errors.New("TABLE_PREFIX may only contain letters, digits and underscores"))
+	}
+	if c.SyntaxTheme != "" && !slices.Contains(web.SyntaxThemes, c.SyntaxTheme) {
+		errs = append(errs, fmt.Errorf("SYNTAX_THEME must be empty or one of %v", web.SyntaxThemes))
 	}
 	if len(c.DeleteSalt) < minSecretLen || isPlaceholder(c.DeleteSalt) {
 		errs = append(errs, fmt.Errorf("DELETE_SALT must be a random value of at least %d characters (not the .env.example placeholder)", minSecretLen))

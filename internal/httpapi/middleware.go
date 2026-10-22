@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +15,12 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const baseCSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+// baseCSP is PrivateBin 2.1.0's default policy (the interface is built for it:
+// lib/Configuration.php, 'cspheader'), identical except that connect-src is
+// narrowed from * to this origin, since the app only talks to itself. 2.1.0's
+// sandbox has no allow-popups and its base-uri is 'self'; TestCSPMatchesPrivateBin210
+// pins all of it.
+const baseCSP = "default-src 'none'; base-uri 'self'; form-action 'none'; manifest-src 'self'; connect-src 'self' blob:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self'; frame-ancestors 'none'; frame-src blob:; img-src 'self' data: blob:; media-src blob:; object-src blob:; sandbox allow-same-origin allow-scripts allow-forms allow-modals allow-downloads"
 
 func securityHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -101,7 +107,7 @@ func newLimiter(r rate.Limit, b int) gin.HandlerFunc {
 	l := &ipLimiter{m: map[string]*visitor{}, rate: r, burst: b}
 	return func(c *gin.Context) {
 		if !l.allow(c.ClientIP(), time.Now()) {
-			fail(c, "Please wait 1 seconds between each post.")
+			fail(c, fmt.Sprintf(msgRateLimitFmt, 1))
 			return
 		}
 		c.Next()

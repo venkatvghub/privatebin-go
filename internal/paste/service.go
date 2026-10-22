@@ -204,16 +204,6 @@ func (s *Service) Read(id string) (*View, error) {
 	return v, nil
 }
 
-// IsBurn reports whether a live paste is burn-after-reading, without
-// consuming it.
-func (s *Service) IsBurn(id string) (bool, error) {
-	p, err := s.peek(id)
-	if err != nil {
-		return false, err
-	}
-	return p.Burn(), nil
-}
-
 // Take atomically deletes a paste (and its comments) and returns it. Of
 // concurrent callers exactly one gets the row; the rest get ErrNotFound.
 func (s *Service) Take(id string) (*model.Paste, error) {

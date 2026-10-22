@@ -1,0 +1,8 @@
+/* privatebin-go additions; loaded after PrivateBin's stylesheet, which stays unmodified. */
+
+/* Discussions are not supported by this server (comment requests return status 1). PrivateBin's
+   script reads the "Open discussion" option unconditionally, so the markup stays in the page,
+   but it must never be shown. */
+#opendiscussionoption {
+  display: none !important;
+}

@@ -10,7 +10,7 @@ Single Go binary (Gin) with the web UI embedded, backed by PostgreSQL (GORM v2).
 - Expiry: 5 min, 10 min, 1 hour, 1 day, 1 week, 1 month, 1 year, never
 - Burn after reading, destroyed atomically on first read (confirmation click first, so link previews cannot burn it)
 - Delete links (HMAC delete tokens)
-- Plain text, Markdown and syntax-highlighted views, rendered client side (marked, DOMPurify, highlight.js; all self-hosted)
+- PrivateBin 2.1.0's own Bootstrap 5 interface: plain text, Markdown with preview, source code highlighted by prettify.js (4 themes), expiry from 5 minutes to "never", burn after reading, optional password, QR code, raw text, clone, email, dark mode and 38 languages
 - PrivateBin v2 JSON API plus OpenAPI/Swagger at `/swagger/` (`/openapi.yaml`)
 - Structured JSON logs (zap) and Prometheus metrics
 - Strict CSP, HSTS, no-referrer, per-IP rate limit, request size limit
@@ -63,6 +63,10 @@ Read from environment variables; a `.env` file (gitignored) is loaded if present
 | `TABLE_PREFIX` | empty | table prefix (PrivateBin `tbl` option) |
 | `SWAGGER_ENABLED` | `true` | serve `/swagger/` and `/openapi.yaml` |
 | `AUTH_ENABLED` | `false` | require OIDC login to create pastes |
+| `APP_TITLE` | `privatebin-go` | name in the page title, navigation and footer |
+| `PAGE_INFO` | empty | extra footer text; may contain HTML such as a link |
+| `SYNTAX_THEME` | empty | prettify theme for source code: `desert`, `doxy`, `sons-of-obsidian` or `sunburst` |
+| `BURN_AFTER_READING_DEFAULT` | `true` | preselect "Burn after reading" in the interface. Users can untick it per paste; the flag is chosen and authenticated by the browser, so the server cannot force it |
 | `TRUSTED_PROXIES` | empty | comma separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted. Leave empty unless behind a reverse proxy, otherwise the per-IP rate limit can be spoofed |
 | `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `SESSION_SECRET` | | needed when `AUTH_ENABLED=true` (`SESSION_SECRET` 32+ chars). Cookies are `Secure` when `BASE_URL` starts with `https://` |
 
@@ -128,7 +132,7 @@ make audit                               # govulncheck + gosec
 1. Fork and create a branch.
 2. Keep the PrivateBin wire format and SQL schema unchanged; do not add server-side features that need plaintext.
 3. Add or update tests; run `go vet ./...`, `go test ./...` and `make deadcode`.
-4. Frontend: no inline scripts or styles (the CSP forbids them), no CDN assets; vendored libraries live in `web/vendor/` with their own licences.
+4. Frontend: the interface files under `web/css`, `web/js`, `web/img` and `web/i18n` are PrivateBin 2.1.0's, unmodified: `go test ./web` verifies their sums and `web/PROVENANCE.md` records where each came from. Upgrade by re-copying a release, not by editing them. Our own page changes go in `web/index.html.tmpl` and `web/css/privatebin-go.css`; no inline script or styles (the CSP forbids them), no CDN assets.
 5. Update `web/openapi.yaml` when the API changes.
 6. Open a pull request describing the change and how you tested it.
 
@@ -136,4 +140,4 @@ Report bugs and request features through the issue templates in `.github/ISSUE_T
 
 ## Credits and licence
 
-The API and storage format are compatible with [PrivateBin](https://github.com/PrivateBin/PrivateBin); the code, UI and crypto are an independent implementation. Licensed under the MIT License, see `LICENSE`.
+The API and storage format are compatible with [PrivateBin](https://github.com/PrivateBin/PrivateBin), and the web interface is PrivateBin 2.1.0's, copied unmodified; see `THIRD_PARTY_NOTICES.md`. The rest of the code is MIT-licensed, see `LICENSE`.

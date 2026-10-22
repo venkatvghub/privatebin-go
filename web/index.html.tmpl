@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en" class="h-100">
+	<head>
+		<meta charset="utf-8" />
+		<meta http-equiv="X-UA-Compatible" content="IE=edge">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta name="robots" content="noindex" />
+		<meta name="google" content="notranslate">
+		<title>{{.Name}}</title>
+		<link type="text/css" rel="stylesheet" href="css/bootstrap5/bootstrap-5.3.8.css" />
+		<link type="text/css" rel="stylesheet" href="css/bootstrap5/privatebin.css?{{.Version}}" />
+		<link type="text/css" rel="stylesheet" href="css/privatebin-go.css?{{.Version}}" />
+		<link type="text/css" rel="stylesheet" href="css/prettify/prettify.css?{{.Version}}" />
+{{- if .SyntaxTheme}}
+		<link type="text/css" rel="stylesheet" href="css/prettify/{{.SyntaxTheme}}.css?{{.Version}}" />
+{{- end}}
+		<noscript><link type="text/css" rel="stylesheet" href="css/noscript.css" /></noscript>
+		<link rel="modulepreload" href="js/zlib-1.3.2.js?{{.Version}}" integrity="{{sri "js/zlib-1.3.2.js"}}" />
+		<script defer type="text/javascript" data-cfasync="false" src="js/kjua-0.10.0.js?{{.Version}}" integrity="{{sri "js/kjua-0.10.0.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/zlib.js?{{.Version}}" integrity="{{sri "js/zlib.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/base-x-5.0.1.js?{{.Version}}" integrity="{{sri "js/base-x-5.0.1.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/bootstrap-5.3.8.js?{{.Version}}" integrity="{{sri "js/bootstrap-5.3.8.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/dark-mode-switch.js?{{.Version}}" integrity="{{sri "js/dark-mode-switch.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/prettify.js?{{.Version}}" integrity="{{sri "js/prettify.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/showdown-2.1.0.js?{{.Version}}" integrity="{{sri "js/showdown-2.1.0.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/purify-3.4.17.js?{{.Version}}" integrity="{{sri "js/purify-3.4.17.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/legacy.js?{{.Version}}" integrity="{{sri "js/legacy.js"}}" crossorigin="anonymous"></script>
+		<script defer type="text/javascript" data-cfasync="false" src="js/privatebin.js?{{.Version}}" integrity="{{sri "js/privatebin.js"}}" crossorigin="anonymous"></script>
+		<!-- icon -->
+		<link rel="apple-touch-icon" href="img/apple-touch-icon.png" sizes="180x180" />
+		<link rel="icon" type="image/png" href="img/favicon-32x32.png" sizes="32x32" />
+		<link rel="icon" type="image/png" href="img/favicon-16x16.png" sizes="16x16" />
+		<link rel="manifest" href="manifest.json?{{.Version}}" />
+		<link rel="mask-icon" href="img/safari-pinned-tab.svg" color="#ffcc00" />
+		<link rel="shortcut icon" href="img/favicon.ico">
+		<meta name="msapplication-config" content="browserconfig.xml">
+		<meta name="theme-color" content="#ffe57e" />
+		<!-- Twitter/social media cards -->
+		<meta name="twitter:card" content="summary" />
+		<meta name="twitter:title" content="Encrypted note on {{.Name}}" />
+		<meta name="twitter:description" content="Visit this link to see the note. Giving the URL to anyone allows them to access the note, too." />
+		<meta name="twitter:image" content="img/apple-touch-icon.png" />
+		<meta property="og:title" content="{{.Name}}" />
+		<meta property="og:site_name" content="{{.Name}}" />
+		<meta property="og:description" content="Visit this link to see the note. Giving the URL to anyone allows them to access the note, too." />
+		<meta property="og:image" content="img/apple-touch-icon.png" />
+		<meta property="og:image:type" content="image/png" />
+		<meta property="og:image:width" content="180" />
+		<meta property="og:image:height" content="180" />
+	</head>
+	<body role="document" data-compression="zlib" class="d-flex flex-column h-100">
+		<div id="passwordmodal" tabindex="-1" class="modal fade" role="dialog" aria-hidden="true">
+			<div class="modal-dialog" role="document">
+				<div class="modal-content">
+					<div class="modal-body">
+						<form id="passwordform" role="form">
+							<div class="mb-3">
+								<label for="passworddecrypt"><svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#eye" /></svg> Please enter the password for this document:</label>
+								<div class="input-group">
+									<input id="passworddecrypt" type="password" class="form-control input-password" placeholder="Enter password" required="required" />
+									<button class="btn btn-outline-secondary toggle-password" type="button" title="Show password" aria-label="Show password">
+										<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#eye" /></svg>
+									</button>
+								</div>
+							</div>
+							<button type="submit" class="btn btn-success btn-block"><svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#power" /></svg> Decrypt</button>
+						</form>
+					</div>
+				</div>
+			</div>
+		</div>
+		<div id="loadconfirmmodal" tabindex="-1" class="modal fade" role="dialog" aria-hidden="true">
+			<div class="modal-dialog" role="document">
+				<div class="modal-content">
+					<div class="modal-header">
+						<h5 class="modal-title">This secret message can only be displayed once. Would you like to see it now?</h5>
+						<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+					</div>
+					<div class="modal-body text-center">
+						<button id="loadconfirm-open-now" type="button" class="btn btn-success" data-bs-dismiss="modal"><svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#cloud-download" /></svg> Yes, see it</button>
+					</div>
+				</div>
+			</div>
+		</div>
+		<div id="qrcodemodal" tabindex="-1" class="modal fade" role="dialog" aria-hidden="true">
+			<div class="modal-dialog" role="document">
+				<div class="modal-content">
+					<div class="modal-header">
+						<h5 class="modal-title">QR code</h5>
+						<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+					</div>
+					<div class="modal-body">
+						<div class="mx-auto" id="qrcode-display"></div>
+					</div>
+				</div>
+			</div>
+		</div>
+		<div id="emailconfirmmodal" tabindex="-1" class="modal fade" role="dialog" aria-hidden="true">
+			<div class="modal-dialog" role="document">
+				<div class="modal-content">
+					<div class="modal-header">
+						<h5 class="modal-title">Recipient may become aware of your timezone, convert time to UTC?</h5>
+						<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+					</div>
+					<div class="modal-body row">
+						<div class="col-xs-12 col-md-6">
+							<button id="emailconfirm-timezone-current" type="button" class="btn btn-danger"><svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#clock" /></svg> Use Current Timezone</button>
+						</div>
+						<div class="col-xs-12 col-md-6 text-right">
+							<button id="emailconfirm-timezone-utc" type="button" class="btn btn-success"><svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#globe" /></svg> Convert To UTC</button>
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+		<nav class="navbar navbar-expand-lg bg-body-tertiary text-nowrap mb-3">
+			<div class="container-fluid">
+				<a class="reloadlink navbar-brand" href="">
+					<img alt="{{.Name}}" src="img/icon.svg" height="38" />
+				</a>
+				<button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbar" aria-controls="navbar" aria-expanded="false" aria-label="Toggle navigation">
+					<span class="navbar-toggler-icon"></span>
+				</button>
+				<div id="navbar" class="collapse navbar-collapse">
+					<ul class="navbar-nav me-auto gap-2 align-items-lg-center align-items-stretch flex-wrap">
+						<li id="loadingindicator" class="navbar-text hidden me-auto">
+							<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#clock" /></svg>
+							Loading…
+						</li>
+						<li class="nav-item d-flex flex-lg-row flex-column hidden">
+							<button id="retrybutton" type="button" class="reloadlink hidden btn btn-primary d-flex justify-content-center align-items-center gap-1">
+								<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#repeat" /></svg> Retry
+							</button>
+						</li>
+						<li class="nav-item d-flex flex-lg-row flex-column gap-2">
+							<button id="newbutton" type="button" class="hidden btn btn-secondary flex-fill d-flex justify-content-center align-items-center gap-1">
+								<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#file-earmark" /></svg> New
+							</button>
+							<button id="clonebutton" type="button" class="hidden btn btn-secondary flex-fill d-flex justify-content-center align-items-center gap-1">
+								<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#copy" /></svg> Clone
+							</button>
+							<button id="rawtextbutton" type="button" class="hidden btn btn-secondary flex-fill d-flex justify-content-center align-items-center gap-1">
+								<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#filetype-txt" /></svg> Raw text
+							</button>
+							<button id="downloadtextbutton" type="button" class="hidden btn btn-secondary flex-fill d-flex justify-content-center align-items-center gap-1">
+								<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#download" /></svg> Save document
+							</button>
+							<button id="emaillink" type="button" class="hidden btn btn-secondary flex-fill d-flex justify-content-center align-items-center gap-1">
+								<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#envelope" /></svg> Email
+							</button>
+							<button id="qrcodelink" type="button" data-bs-toggle="modal" data-bs-target="#qrcodemodal" class="hidden btn btn-secondary flex-fill d-flex justify-content-center align-items-center gap-1">
+								<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#qr-code" /></svg> QR code
+							</button>
+						</li>
+						<li id="expiration" class="nav-item d-flex hidden">
+							<label for="pasteExpiration" class="form-label my-auto me-1">Expires:</label>
+							<select id="pasteExpiration" name="pasteExpiration" class="form-select">
+								<option value="5min">5 minutes</option>
+								<option value="10min">10 minutes</option>
+								<option value="1hour">1 hour</option>
+								<option value="1day">1 day</option>
+								<option value="1week" selected="selected">1 week</option>
+								<option value="1month">1 month</option>
+								<option value="1year">1 year</option>
+								<option value="never">Never</option>
+							</select>
+						</li>
+						<li class="nav-item">
+							<div id="burnafterreadingoption" class="navbar-text form-check hidden">
+								<input class="form-check-input" type="checkbox" id="burnafterreading" name="burnafterreading"{{if .BurnAfterReading}} checked="checked"{{end}} />
+								<label class="form-check-label" for="burnafterreading">
+									Burn after reading
+								</label>
+							</div>
+						</li>
+						<li class="nav-item">
+							<div id="opendiscussionoption" class="navbar-text form-check hidden">
+								<input class="form-check-input" type="checkbox" id="opendiscussion" name="opendiscussion" />
+								<label class="form-check-label" for="opendiscussion">
+									Open discussion
+								</label>
+							</div>
+						</li>
+						<li class="nav-item">
+							<div id="password" class="navbar-form hidden">
+								<div class="input-group">
+									<input type="password" id="passwordinput" placeholder="Password (recommended)" aria-label="Password (recommended)" class="form-control input-password" size="23" />
+									<button class="btn btn-outline-secondary toggle-password" type="button" title="Show password" aria-label="Show password">
+										<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#eye" /></svg>
+									</button>
+								</div>
+							</div>
+						</li>
+						<li id="formatter" class="nav-item d-flex hidden">
+							<label for="pasteFormatter" class="form-label my-auto me-1">Format:</label>
+							<select id="pasteFormatter" name="pasteFormatter" class="form-select">
+								<option value="plaintext" selected="selected">Plain Text</option>
+								<option value="syntaxhighlighting">Source Code</option>
+								<option value="markdown">Markdown</option>
+							</select>
+						</li>
+					</ul>
+					<ul class="navbar-nav gap-2">
+{{- if .AuthEnabled}}
+						<li class="nav-item">
+							<a class="nav-link" href="auth/login">Log in</a>
+						</li>
+{{- end}}
+						<li class="nav-item">
+							<div class="form-check form-switch navbar-text">
+								<input id="bd-theme" type="checkbox" class="form-check-input" />
+								<label for="bd-theme" class="form-check-label">Dark Mode</label>
+							</div>
+						</li>
+					</ul>
+				</div>
+			</div>
+		</nav>
+		<main>
+			<section class="container-fluid mt-2">
+				<div id="remainingtime" role="alert" class="hidden alert alert-info">
+					<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#fire" /></svg>
+				</div>
+				<div id="status" role="alert" class="d-flex align-items-center gap-2 alert alert-{{if .Deleted}}success{{else}}info{{end}}{{if not .Status}} hidden{{end}}">
+					<div>
+						<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#info-circle" /></svg>
+						{{.Status}}
+					</div>
+{{- if .Deleted}}
+					<button type="button" class="btn btn-secondary d-flex justify-content-center align-items-center gap-1 ms-auto" id="new-from-alert">
+						<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#repeat" /></svg>
+						Start over
+					</button>
+{{- end}}
+				</div>
+				<div id="errormessage" role="alert" class="{{if not .Error}}hidden {{end}}alert alert-danger">
+					<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#exclamation-triangle" /></svg>
+					{{.Error}}
+				</div>
+				<noscript>
+					<div id="noscript" role="alert" class="alert alert-warning">
+						<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#exclamation-circle" /></svg>
+						JavaScript is required for {{.Name}} to work. Sorry for the inconvenience.
+					</div>
+				</noscript>
+				<div id="oldnotice" role="alert" class="hidden alert alert-danger">
+					<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#exclamation-triangle" /></svg>
+					{{.Name}} requires a modern browser to work.
+					<a href="https://www.mozilla.org/firefox/">Firefox</a>,
+					<a href="https://www.opera.com/">Opera</a>,
+					<a href="https://www.google.com/chrome">Chrome</a>…<br />
+					<span class="small">For more information <a href="https://github.com/PrivateBin/PrivateBin/wiki/FAQ#why-does-it-show-me-the-error-privatebin-requires-a-modern-browser-to-work">see this FAQ entry</a>.</span>
+				</div>
+				<div id="httpnotice" role="alert" class="hidden alert alert-danger">
+					<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#exclamation-triangle" /></svg>
+					This website is using an insecure connection! Please only use it for testing.<br />
+					<span class="small">For more information <a href="https://github.com/PrivateBin/PrivateBin/wiki/FAQ#why-does-it-show-me-an-error-about-an-insecure-connection">see this FAQ entry</a>.</span>
+				</div>
+				<div id="insecurecontextnotice" role="alert" class="hidden alert alert-danger">
+					<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#exclamation-triangle" /></svg>
+					Your browser may require an HTTPS connection to support the WebCrypto API. Try switching to HTTPS.
+				</div>
+				<div id="pastesuccess" class="hidden">
+					<div class="nav justify-content-between mb-2">
+						<button id="copyLink" type="button" class="btn btn-secondary d-flex justify-content-center align-items-center gap-1">
+							<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#copy" /></svg> Copy link
+						</button>
+						<a href="#" id="deletelink" class="btn btn-secondary d-flex justify-content-center align-items-center gap-1">
+							<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#trash" /></svg>
+							<span></span>
+						</a>
+					</div>
+					<div role="alert" class="alert alert-success">
+						<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#check" /></svg>
+						<div id="pastelink"></div>
+					</div>
+				</div>
+				<ul id="editorTabs" class="nav nav-tabs hidden">
+					<li role="presentation" class="nav-item me-1"><a class="nav-link active" role="tab" id="messageedit" href="#">Editor</a></li>
+					<li role="presentation" class="nav-item me-1"><a class="nav-link" role="tab" id="messagepreview" href="#">Preview</a></li>
+					<li role="presentation" class="nav-item ms-auto">
+						<button id="sendbutton" type="button" tabindex="2" class="hidden btn btn-primary d-flex justify-content-center align-items-center gap-1" title="Hit Ctrl+s to create the document, storing it on {{.Name}}">
+							<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#cloud-upload" /></svg> Create
+						</button>
+					</li>
+				</ul>
+			</section>
+			<section class="container-fluid">
+				<article>
+					<div id="placeholder" class="col-md-12 hidden">+++ no document text +++</div>
+					<div id="attachmentPreview" class="col-md-12 text-center hidden"></div>
+					<h6 id="copyShortcutHint" class="col-md-12 nav justify-content-between align-items-center mb-2 hidden">
+						<small id="copyShortcutHintText" class="d-none d-md-inline">
+							To copy document press on the copy button or use the clipboard shortcut <kbd>Ctrl</kbd>+<kbd>c</kbd>
+						</small>
+						<button type="button" id="copyShortcutHintBtn" class="btn btn-secondary ms-auto">Copy</button>
+					</h6>
+					<div id="prettymessage" class="card col-md-12 hidden">
+						<pre id="prettyprint" class="card-body col-md-12 prettyprint linenums:1"></pre>
+					</div>
+					<div id="plaintext" class="col-md-12 hidden"></div>
+					<p class="col-md-12"><textarea id="message" name="message" cols="80" rows="25" aria-label="Document text" tabindex="1" class="form-control hidden"></textarea></p>
+					<p class="col-md-12 form-check form-switch">
+						<input id="messagetab" type="checkbox" tabindex="3" class="form-check-input" checked="checked" />
+						<label for="messagetab" class="form-check-label">
+							Tabulator key serves as character (Hit <kbd>Ctrl</kbd>+<kbd>m</kbd> or <kbd>Esc</kbd> to toggle)
+						</label>
+					</p>
+				</article>
+			</section>
+			<section class="container-fluid">
+				<div id="discussion" class="hidden">
+					<h4>Discussion</h4>
+					<div id="commentcontainer"></div>
+				</div>
+			</section>
+			<section class="container-fluid">
+				<div id="noscript" role="alert" class="alert alert-info noscript-hide">
+					<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#exclamation-circle" /></svg>
+					Loading…<br />
+					<span class="small">In case this message never disappears please have a look at <a href="https://github.com/PrivateBin/PrivateBin/wiki/FAQ#why-does-the-loading-message-not-go-away">this FAQ for information to troubleshoot</a>.</span>
+				</div>
+			</section>
+		</main>
+		<footer class="container-fluid mt-auto">
+			<div class="row">
+				<h5 class="col-md-5 col-xs-8">{{.Name}} <small>- Because ignorance is bliss</small></h5>
+				<p class="col-md-1 col-xs-4 text-center">{{.Version}}</p>
+				<p id="aboutbox" class="col-md-6 col-xs-12">
+					{{.Name}} is a minimalist, open source online pastebin where the server has zero knowledge of stored data. Data is encrypted/decrypted <i>in the browser</i> using 256 bits AES. {{.Info}}
+				</p>
+			</div>
+		</footer>
+		<div id="serverdata" class="hidden" aria-hidden="true">
+			<div id="templates">
+				<article id="commenttemplate" class="comment px-2 pb-3">
+					<div class="commentmeta">
+						<span class="nickname">name</span>
+						<span class="commentdate">0000-00-00</span>
+					</div>
+					<div class="commentdata">c</div>
+					<button class="btn btn-secondary btn-sm">Reply</button>
+				</article>
+				<p id="commenttailtemplate" class="comment px-2 pb-3">
+					<button class="btn btn-secondary btn-sm">Add comment</button>
+				</p>
+				<div id="replytemplate" class="reply hidden">
+					<input type="text" id="nickname" class="form-control my-2" title="Optional nickname…" placeholder="Optional nickname…" />
+					<textarea id="replymessage" class="replymessage form-control" cols="80" rows="7"></textarea><br />
+					<div id="replystatus" role="alert" class="statusmessage hidden alert">
+						<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#info-circle" /></svg>
+					</div>
+					<button id="replybutton" class="btn btn-secondary btn-sm">Post comment</button>
+				</div>
+				<div id="attachmenttemplate" role="alert" class="hidden alert alert-info">
+					<svg width="16" height="16" fill="currentColor" aria-hidden="true"><use href="img/bootstrap-icons.svg#download" /></svg>
+					<a class="alert-link">Download attachment<span></span></a>
+				</div>
+			</div>
+		</div>
+	</body>
+</html>
