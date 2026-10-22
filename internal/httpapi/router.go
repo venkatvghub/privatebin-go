@@ -35,10 +35,15 @@ type Deps struct {
 	Page    web.IndexData // its parameters, for the pages that add a status or error
 }
 
-// idRe matches ids from paste.newID; web/js/app.js mirrors it.
+// idRe matches ids from paste.newID, and PrivateBin's own id pattern.
 var idRe = regexp.MustCompile(`^[a-f0-9]{16}$`)
 
-// Messages copied from PrivateBin so clients matching on them keep working.
+// Messages are PrivateBin 2.1.0's, verbatim, so clients and the interface's
+// translations that match on them keep working. 2.1.0 says "Document", not the
+// "Paste" of older releases: lib/Controller.php GENERIC_ERROR, "Document is
+// limited to %s of encrypted data.", "Wrong deletion token. Document was not
+// deleted." and "Document was properly deleted."; the rate limit text is from
+// lib/Persistence/TrafficLimiter.php. TestMessagesMatchPrivateBin210 pins them.
 const (
 	msgNotFound   = "Document does not exist, has expired or has been deleted."
 	msgInvalid    = "Invalid data."

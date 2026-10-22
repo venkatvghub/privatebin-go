@@ -234,3 +234,24 @@ func TestDeleteLinkPage(t *testing.T) {
 		t.Error("deleting again must report that the document does not exist")
 	}
 }
+
+// The wording is a compatibility contract with PrivateBin 2.1.0 (see the
+// comment on the message constants); a change here must be deliberate.
+func TestMessagesMatchPrivateBin210(t *testing.T) {
+	for got, want := range map[string]string{
+		msgNotFound:   "Document does not exist, has expired or has been deleted.",
+		msgWrongToken: "Wrong deletion token. Document was not deleted.",
+		msgInvalid:    "Invalid data.",
+	} {
+		if got != want {
+			t.Errorf("message %q, PrivateBin 2.1.0 says %q", got, want)
+		}
+	}
+	// The size-limit message is built in the handler: check what a client sees.
+	h := newTestRouter(t, func(c *config.Config) { c.MaxPasteBytes = 1 << 10 })
+	big := strings.Replace(reqBody, `"ct":"AAAA"`, `"ct":"`+strings.Repeat("A", 4096)+`"`, 1)
+	big = strings.Replace(big, "%d", "0", 1)
+	if got := do(h, "POST", "/", big, true); got["message"] != "Document is limited to 1.00 KiB of encrypted data." {
+		t.Errorf("size limit message: %v", got)
+	}
+}
