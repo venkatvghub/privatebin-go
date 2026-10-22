@@ -14,7 +14,9 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const baseCSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+// baseCSP is PrivateBin's default policy (the interface is built for it), with
+// connect-src narrowed from * to this origin: the app only talks to itself.
+const baseCSP = "default-src 'none'; base-uri 'self'; form-action 'none'; manifest-src 'self'; connect-src 'self' blob:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self'; frame-ancestors 'none'; frame-src blob:; img-src 'self' data: blob:; media-src blob:; object-src blob:; sandbox allow-same-origin allow-scripts allow-forms allow-modals allow-downloads"
 
 func securityHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {

@@ -1,0 +1,6193 @@
+'use strict';
+/**
+ * PrivateBin
+ *
+ * a zero-knowledge paste bin
+ *
+ * @see       {@link https://github.com/PrivateBin/PrivateBin}
+ * @copyright 2012 Sébastien SAUVAGE ({@link http://sebsauvage.net})
+ * @license   {@link https://www.opensource.org/licenses/zlib-license.php The zlib/libpng License}
+ * @name      PrivateBin
+ * @namespace
+ */
+
+/**
+ * draghover plugin replacement
+ * adds draghoverstart and draghoverend events to an element
+ */
+function draghover(element) {
+    let collection = new Set();
+
+    element.addEventListener('dragenter', function (e) {
+        if (collection.size === 0) {
+            element.dispatchEvent(new CustomEvent('draghoverstart'));
+        }
+        collection.add(e.target);
+    });
+
+    element.addEventListener('dragleave', function (e) {
+        collection.delete(e.target);
+        if (collection.size === 0) {
+            element.dispatchEvent(new CustomEvent('draghoverend'));
+        }
+    });
+
+    element.addEventListener('drop', function (e) {
+        collection.delete(e.target);
+        if (collection.size === 0) {
+            element.dispatchEvent(new CustomEvent('draghoverend'));
+        }
+    });
+}
+
+window.PrivateBin = (function () {
+
+    /**
+     * zlib library interface
+     *
+     * @private
+     */
+    let z;
+
+    /**
+     * DOMpurify settings for HTML content
+     *
+     * @private
+     */
+    const purifyHtmlConfig = {
+        ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|magnet):)/i,
+        ALLOWED_ATTR: ['href'],
+        USE_PROFILES: {
+            html: true
+        }
+    };
+
+    /**
+     * DOMpurify settings for HTML content, where only a strict subset is allowed.
+     *
+     * NOTE: The key {@link purifyHtmlConfig.USE_PROFILES} **must not** be included,
+     * as otherwise `USE_PROFILES` takes precedence over {@link purifyHtmlConfigStrictSubset.ALLOWED_TAGS}.
+     *
+     * @private
+     */
+    const purifyHtmlConfigStrictSubset = {
+        ALLOWED_URI_REGEXP: purifyHtmlConfig.ALLOWED_URI_REGEXP,
+        ALLOWED_TAGS: ['a'],
+        ALLOWED_ATTR: ['href']
+    };
+
+    /**
+     * DOMpurify settings for SVG content
+     *
+     * @private
+     */
+    const purifySvgConfig = {
+        USE_PROFILES: {
+            svg: true,
+            svgFilters: true
+        }
+    };
+
+    /**
+     * DOMpurify settings for translated messages, which are allowed to include limited HTML.
+     *
+     * NOTE: The key {@link purifyHtmlConfig.USE_PROFILES} **must not** be included,
+     * as otherwise `USE_PROFILES` takes precedence over {@link purifyHtmlConfigStrictSubset.ALLOWED_TAGS}.
+     *
+     * @private
+     */
+    const purifyTranslationConfig = {
+        ALLOWED_URI_REGEXP: /^(?:https?:)/i, // the only URL expected here is the generated document, so only http & https
+        ALLOWED_TAGS: ['a', 'i', 'span', 'kbd'],
+        ALLOWED_ATTR: ['href', 'id'] // one of the messages contains an id attribute
+    };
+
+    /**
+     * URL fragment prefix requiring load confirmation
+     *
+     * @private
+     */
+    const loadConfirmPrefix = '#-';
+
+    /**
+     * CryptoData class
+     *
+     * bundles helper functions used in both document and comment formats
+     *
+     * @name CryptoData
+     * @class
+     */
+    function CryptoData(data) {
+        // store all keys in the default locations for drop-in replacement
+        for (const key in data) {
+            if (Object.prototype.hasOwnProperty.call(data, key)) {
+                this[key] = data[key];
+            }
+        }
+
+        /**
+         * gets the cipher data (cipher text + adata)
+         *
+         * @name CryptoData.getCipherData
+         * @function
+         * @return {Array}
+         */
+        this.getCipherData = function () {
+            return [this.ct, this.adata];
+        };
+    }
+
+    /**
+     * Paste class
+     *
+     * bundles helper functions around the document formats
+     *
+     * @name Paste
+     * @class
+     */
+    function Paste(data) {
+        // inherit constructor and methods of CryptoData
+        CryptoData.call(this, data);
+
+        /**
+         * gets the used formatter
+         *
+         * @name Paste.getFormat
+         * @function
+         * @return {string}
+         */
+        this.getFormat = function () {
+            return this.adata[1];
+        };
+
+        /**
+         * gets the remaining seconds before the document expires
+         *
+         * returns 0 if there is no expiration
+         *
+         * @name Paste.getTimeToLive
+         * @function
+         * @return {string}
+         */
+        this.getTimeToLive = function () {
+            return this.meta.time_to_live || 0;
+        };
+
+        /**
+         * is burn-after-reading enabled
+         *
+         * @name Paste.isBurnAfterReadingEnabled
+         * @function
+         * @return {bool}
+         */
+        this.isBurnAfterReadingEnabled = function () {
+            return this.adata[3];
+        };
+
+        /**
+         * are discussions enabled
+         *
+         * @name Paste.isDiscussionEnabled
+         * @function
+         * @return {bool}
+         */
+        this.isDiscussionEnabled = function () {
+            return this.adata[2];
+        };
+    }
+
+    /**
+     * Comment class
+     *
+     * bundles helper functions around the comment formats
+     *
+     * @name Comment
+     * @class
+     */
+    function Comment(data) {
+        // inherit constructor and methods of CryptoData
+        CryptoData.call(this, data);
+
+        /**
+         * gets the UNIX timestamp of the comment creation
+         *
+         * @name Comment.getCreated
+         * @function
+         * @return {int}
+         */
+        this.getCreated = function () {
+            return this.meta.created || 0;
+        };
+
+        /**
+         * gets the icon of the comment submitter
+         *
+         * @name Comment.getIcon
+         * @function
+         * @return {string}
+         */
+        this.getIcon = function () {
+            return this.meta.icon || '';
+        };
+    }
+
+    /**
+     * static Helper methods
+     *
+     * @name Helper
+     * @class
+     */
+    const Helper = (function () {
+        const me = {};
+
+        /**
+         * character to HTML entity lookup table
+         *
+         * @see    {@link https://github.com/janl/mustache.js/blob/master/mustache.js#L60}
+         * @name Helper.entityMap
+         * @private
+         * @enum   {Object}
+         * @readonly
+         */
+        const entityMap = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            '\'': '&#39;',
+            '/': '&#x2F;',
+            '`': '&#x60;',
+            '=': '&#x3D;'
+        };
+
+        /**
+         * number of seconds in a minute
+         *
+         * @name Helper.minute
+         * @private
+         * @enum   {number}
+         * @readonly
+         */
+        const minute = 60;
+
+        /**
+         * number of seconds in an hour
+         *
+         * = 60 * 60 seconds
+         *
+         * @name Helper.minute
+         * @private
+         * @enum   {number}
+         * @readonly
+         */
+        const hour = 3600;
+
+        /**
+         * number of seconds in a day
+         *
+         * = 60 * 60 * 24 seconds
+         *
+         * @name Helper.day
+         * @private
+         * @enum   {number}
+         * @readonly
+         */
+        const day = 86400;
+
+        /**
+         * number of seconds in a week
+         *
+         * = 60 * 60 * 24 * 7 seconds
+         *
+         * @name Helper.week
+         * @private
+         * @enum   {number}
+         * @readonly
+         */
+        const week = 604800;
+
+        /**
+         * number of seconds in a month (30 days, an approximation)
+         *
+         * = 60 * 60 * 24 * 30 seconds
+         *
+         * @name Helper.month
+         * @private
+         * @enum   {number}
+         * @readonly
+         */
+        const month = 2592000;
+
+        /**
+         * number of seconds in a non-leap year
+         *
+         * = 60 * 60 * 24 * 365 seconds
+         *
+         * @name Helper.year
+         * @private
+         * @enum   {number}
+         * @readonly
+         */
+        const year = 31536000;
+
+        /**
+         * cache for script location
+         *
+         * @name Helper.baseUri
+         * @private
+         * @enum   {string|null}
+         */
+        let baseUri = null;
+
+        /**
+         * converts a duration (in seconds) into human friendly approximation
+         *
+         * @name Helper.secondsToHuman
+         * @function
+         * @param  {number} seconds
+         * @return {Array}
+         */
+        me.secondsToHuman = function (seconds) {
+            let v;
+            if (seconds < minute) {
+                v = Math.floor(seconds);
+                return [v, 'second'];
+            }
+            if (seconds < hour) {
+                v = Math.floor(seconds / minute);
+                return [v, 'minute'];
+            }
+            if (seconds < day) {
+                v = Math.floor(seconds / hour);
+                return [v, 'hour'];
+            }
+            // If less than 2 months, display in days:
+            if (seconds <= (2 * month)) {
+                v = Math.floor(seconds / day);
+                return [v, 'day'];
+            }
+            v = Math.floor(seconds / month);
+            return [v, 'month'];
+        };
+
+        /**
+         * converts a duration string into seconds
+         *
+         * The string is expected to be optional digits, followed by a time.
+         * Supported times are: min, hour, day, month, year, never
+         * Examples: 5min, 13hour, never
+         *
+         * @name Helper.durationToSeconds
+         * @function
+         * @param  {String} duration
+         * @return {number}
+         */
+        me.durationToSeconds = function (duration) {
+            let pieces = duration.split(/(\D+)/),
+                factor = pieces[0] || 0,
+                timespan = pieces[1] || pieces[0];
+            switch (timespan) {
+                case 'min':
+                    return factor * minute;
+                case 'hour':
+                    return factor * hour;
+                case 'day':
+                    return factor * day;
+                case 'week':
+                    return factor * week;
+                case 'month':
+                    return factor * month;
+                case 'year':
+                    return factor * year;
+                case 'never':
+                    return 0;
+                default:
+                    return factor;
+            }
+        };
+
+        /**
+         * text range selection
+         *
+         * @name   Helper.selectText
+         * @function
+         * @param  {HTMLElement} element
+         */
+        me.selectText = function (element) {
+            let range, selection;
+
+            if (window.getSelection) {
+                selection = window.getSelection();
+                if (!selection) {
+                    console.warn('window.getSelection() returned null, could not get any select text');
+                    return;
+                }
+                range = document.createRange();
+                range.selectNodeContents(element);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+        };
+
+        /**
+         * convert URLs to clickable links in the provided element.
+         *
+         * URLs to handle:
+         * <pre>
+         *     magnet:?xt.1=urn:sha1:YNCKHTQCWBTRNJIV4WNAE52SJUQCZO5C&xt.2=urn:sha1:TXGCZQTH26NL6OUQAJJPFALHG2LTGBC7
+         *     https://example.com:8800/zero/?6f09182b8ea51997#WtLEUO5Epj9UHAV9JFs+6pUQZp13TuspAUjnF+iM+dM=
+         *     http://user:example.com@localhost:8800/zero/?6f09182b8ea51997#WtLEUO5Epj9UHAV9JFs+6pUQZp13TuspAUjnF+iM+dM=
+         * </pre>
+         *
+         * @name   Helper.urls2links
+         * @function
+         * @param  {HTMLElement} element
+         * @param  {Boolean} strict - optional
+         */
+        me.urls2links = function (element, strict = true) {
+            const raw = element.innerHTML;
+            element.innerHTML = DOMPurify.sanitize(
+                raw.replace(
+                    /(((https?|ftp):\/\/[\w?!=&.\/;#@~%+*-]+(?![\w\s?!&.\/;#~%"=-]>))|((magnet):[\w?=&.\/;#@~%+*-]+))/ig,
+                    '<a href="$1">$1</a>'
+                ),
+                strict ? purifyHtmlConfigStrictSubset : purifyHtmlConfig
+            );
+            element.querySelectorAll('a').forEach(function (link) {
+                const href = link.getAttribute('href');
+                if (href && href.match(/^(?:(?:(?:f|ht)tps?|mailto|magnet):)/i)) {
+                    link.setAttribute('target', '_blank');
+                    link.setAttribute('rel', 'nofollow noopener noreferrer');
+                }
+            });
+        };
+
+        /**
+         * minimal sprintf emulation for %s and %d formats
+         *
+         * Note that this function needs the parameters in the same order as the
+         * format strings appear in the string, contrary to the original.
+         *
+         * @see    {@link https://stackoverflow.com/questions/610406/javascript-equivalent-to-printf-string-format#4795914}
+         * @name   Helper.sprintf
+         * @function
+         * @param  {string} format
+         * @param  {...*} args - one or multiple parameters injected into format string
+         * @return {string}
+         */
+        me.sprintf = function () {
+            const args = Array.prototype.slice.call(arguments);
+            let format = args[0],
+                i = 1;
+            return format.replace(/%(s|d)/g, function (m) {
+                let val = args[i];
+                if (m === '%d') {
+                    val = parseFloat(val);
+                    if (isNaN(val)) {
+                        val = 0;
+                    }
+                }
+                ++i;
+                return val;
+            });
+        };
+
+        /**
+         * get value of cookie, if it was set, empty string otherwise
+         *
+         * @see    {@link http://www.w3schools.com/js/js_cookies.asp}
+         * @name   Helper.getCookie
+         * @function
+         * @param  {string} cname - may not be empty
+         * @return {string}
+         */
+        me.getCookie = function (cname) {
+            const name = cname + '=',
+                ca = document.cookie.split(';');
+            for (let i = 0; i < ca.length; ++i) {
+                let c = ca[i].trim();
+                if (c.startsWith(name))
+                {
+                    return c.substring(name.length, c.length);
+                }
+            }
+            return '';
+        };
+
+        /**
+         * get the current location (without search or hash part of the URL),
+         * eg. https://example.com/path/?aaaa#bbbb --> https://example.com/path/
+         *
+         * @name   Helper.baseUri
+         * @function
+         * @return {string}
+         */
+        me.baseUri = function () {
+            // check for cached version
+            if (baseUri !== null) {
+                return baseUri;
+            }
+
+            baseUri = window.location.origin + window.location.pathname;
+            return baseUri;
+        };
+
+        /**
+         * wrap an object into a Paste, used for mocking in the unit tests
+         *
+         * @name   Helper.PasteFactory
+         * @function
+         * @param  {object} data
+         * @return {Paste}
+         */
+        me.PasteFactory = function (data) {
+            return new Paste(data);
+        };
+
+        /**
+         * wrap an object into a Comment, used for mocking in the unit tests
+         *
+         * @name   Helper.CommentFactory
+         * @function
+         * @param  {object} data
+         * @return {Comment}
+         */
+        me.CommentFactory = function (data) {
+            return new Comment(data);
+        };
+
+        /**
+         * convert all applicable characters to HTML entities
+         *
+         * @see    {@link https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html}
+         * @name   Helper.htmlEntities
+         * @function
+         * @param  {string} str
+         * @return {string} escaped HTML
+         */
+        me.htmlEntities = function (str) {
+            return String(str).replace(
+                /[&<>"'`=\/]/g, function (s) {
+                    return entityMap[s];
+                }
+            );
+        };
+
+        /**
+         * calculate expiration date given initial date and expiration period
+         *
+         * @name   Helper.calculateExpirationDate
+         * @function
+         * @param  {Date} initialDate - may not be empty
+         * @param  {string|number} expirationDisplayStringOrSecondsToExpire - may not be empty
+         * @return {Date}
+         */
+        me.calculateExpirationDate = function (initialDate, expirationDisplayStringOrSecondsToExpire) {
+            let expirationDate = new Date(initialDate),
+                secondsToExpiration = expirationDisplayStringOrSecondsToExpire;
+            if (typeof expirationDisplayStringOrSecondsToExpire === 'string') {
+                secondsToExpiration = me.durationToSeconds(expirationDisplayStringOrSecondsToExpire);
+            }
+
+            if (typeof secondsToExpiration !== 'number') {
+                throw new Error('Cannot calculate expiration date.');
+            }
+            if (secondsToExpiration === 0) {
+                return null;
+            }
+
+            expirationDate = expirationDate.setUTCSeconds(expirationDate.getUTCSeconds() + secondsToExpiration);
+            return expirationDate;
+        };
+
+        /**
+         * Convert Bytes to kB/MB/GB/TB/PB/EB/ZB/YB
+         *
+         * @name   Helper.formatBytes
+         * @function
+         *
+         * @param  {number} bytes
+         * @return {string}
+         */
+        me.formatBytes = function (bytes) {
+            let result = '';
+            const kilobyte = 1000;
+            const decimalPoint = 2;
+            const sizes = [
+                I18n._('B'), I18n._('kB'), I18n._('MB'), I18n._('GB'), I18n._('TB'),
+                I18n._('PB'), I18n._('EB'), I18n._('ZB'), I18n._('YB')
+            ];
+            const index = Math.floor(Math.log(bytes) / Math.log(kilobyte));
+
+            if (bytes > 0) {
+                result = parseFloat((bytes / Math.pow(kilobyte, index)).toFixed(decimalPoint)) + ' ' + sizes[index];
+            } else {
+                result = `0 ${I18n._('B')}`;
+            }
+
+            return result;
+        };
+
+        /**
+         * resets state, used for unit testing
+         *
+         * @name   Helper.reset
+         * @function
+         */
+        me.reset = function () {
+            baseUri = null;
+        };
+
+        /**
+         * check if bootstrap5 object detected
+         *
+         * @name Helper.isBootstrap5
+         * @returns {Boolean}
+         */
+        me.isBootstrap5 = function () {
+            return typeof bootstrap !== 'undefined';
+        };
+
+        return me;
+    })();
+
+    /**
+     * internationalization module
+     *
+     * @name I18n
+     * @class
+     */
+    const I18n = (function () {
+        const me = {};
+
+        /**
+         * const for string of loaded language
+         *
+         * @name I18n.languageLoadedEvent
+         * @private
+         * @prop   {string}
+         * @readonly
+         */
+        const languageLoadedEvent = 'languageLoaded';
+
+        /**
+         * supported languages, minus the built in 'en'
+         *
+         * @name I18n.supportedLanguages
+         * @private
+         * @prop   {string[]}
+         * @readonly
+         */
+        const supportedLanguages = ['ar', 'bg', 'ca', 'co', 'cs', 'de', 'el', 'es', 'et', 'fa', 'fi', 'fr', 'he', 'hu', 'id', 'it', 'ja', 'jbo', 'lt', 'no', 'nl', 'pl', 'pt', 'oc', 'ro', 'ru', 'sk', 'sl', 'sv', 'th', 'tr', 'uk', 'zh', 'zh-tw'];
+
+        /**
+         * built in language
+         *
+         * @name I18n.language
+         * @private
+         * @prop   {string|null}
+         */
+        let language = null;
+
+        /**
+         * translation cache
+         *
+         * @name I18n.translations
+         * @private
+         * @enum   {Object}
+         */
+        let translations = Object.create(null);
+
+        /**
+         * translate a string, alias for I18n.translate
+         *
+         * @name   I18n._
+         * @function
+         * @param  {HTMLElement} element - optional
+         * @param  {string} messageId
+         * @param  {...*} args - one or multiple parameters injected into placeholders
+         * @return {string}
+         */
+        me._ = function () {
+            return me.translate.apply(this, arguments);
+        };
+
+        /**
+         * translate a string
+         *
+         * Optionally pass an HTMLElement as the first parameter, to automatically
+         * let the text of this element be replaced. In case the (asynchronously
+         * loaded) language is not downloaded yet, this will make sure the string
+         * is replaced when it eventually gets loaded. Using this is both simpler
+         * and more secure, as it avoids potential XSS when inserting text.
+         * The next parameter is the message ID, matching the ones found in
+         * the translation files under the i18n directory.
+         * Any additional parameters will get inserted into the message ID in
+         * place of %s (strings) or %d (digits), applying the appropriate plural
+         * in case of digits. See also Helper.sprintf().
+         *
+         * @name   I18n.translate
+         * @function
+         * @param  {HTMLElement} element - optional
+         * @param  {string} messageId
+         * @param  {...*} args - one or multiple parameters injected into placeholders
+         * @return {string}
+         */
+        me.translate = function () // eslint-disable-line complexity
+        {
+            // convert parameters to array
+            let args = Array.prototype.slice.call(arguments),
+                messageId,
+                element = null;
+
+            // parse arguments
+            if (args[0] === null || args[0] instanceof HTMLElement) {
+                // optional HTMLElement as first parameter (null means element not found)
+                element = args[0];
+                args.shift();
+            }
+
+            // extract messageId from arguments
+            let usesPlurals = Array.isArray(args[0]);
+            if (usesPlurals) {
+                // use the first plural form as messageId, otherwise the singular
+                messageId = args[0].length > 1 ? args[0][1] : args[0][0];
+            } else {
+                messageId = args[0];
+            }
+
+            if (messageId.length === 0) {
+                return messageId;
+            }
+
+            // if no translation string cannot be found (in translations object)
+            if (!Object.prototype.hasOwnProperty.call(translations, messageId) || language === null) {
+                // if language is still loading and we have an element assigned
+                if (language === null && element !== null) {
+                    // handle the error by attaching the language loaded event
+                    let orgArguments = arguments;
+                    document.addEventListener(languageLoadedEvent, function () {
+                        // re-execute this function
+                        me.translate.apply(this, orgArguments);
+                    });
+
+                    // and fall back to English for now until the real language
+                    // file is loaded
+                }
+
+                // for all other languages than English for which this behaviour
+                // is expected as it is built-in, log error
+                if (language !== null && language !== 'en') {
+                    console.error('Missing translation for: ', messageId, 'in language', language);
+                    // fallback to English
+                }
+
+                // save English translation (should be the same on both sides)
+                translations[messageId] = args[0];
+            }
+
+            // lookup plural translation
+            if (usesPlurals && Array.isArray(translations[messageId])) {
+                let n = parseInt(args[1] || 1, 10),
+                    key = me.getPluralForm(n),
+                    maxKey = translations[messageId].length - 1;
+                if (key > maxKey) {
+                    key = maxKey;
+                }
+                args[0] = translations[messageId][key];
+                args[1] = n;
+            } else {
+                // lookup singular translation
+                args[0] = translations[messageId];
+            }
+
+            // messageID may contain HTML, but should be from a trusted source (code or translation JSON files)
+            let containsHtml = isStringContainsHtml(args[0]);
+
+            // prevent double encoding, when we insert into a text node
+            if (containsHtml || element === null) {
+                for (let i = 0; i < args.length; ++i) {
+                    // parameters (i > 0) may never contain HTML as they may come from untrusted parties
+                    if ((containsHtml ? i > 1 : i > 0) || !containsHtml) {
+                        args[i] = Helper.htmlEntities(args[i]);
+                    }
+                }
+            }
+            // format string
+            let output = Helper.sprintf.apply(this, args);
+
+            if (containsHtml) {
+                // only allow tags/attributes we actually use in translations
+                output = DOMPurify.sanitize(output, purifyTranslationConfig);
+            }
+
+            // if element is given, insert translation
+            if (element !== null) {
+                if (containsHtml) {
+                    element.innerHTML = output;
+                } else {
+                    // text node takes care of entity encoding
+                    element.textContent = output;
+                }
+                return '';
+            }
+
+            return output;
+        };
+
+        /**
+         * get currently loaded language
+         *
+         * @name   I18n.getLanguage
+         * @function
+         * @return {string}
+         */
+        me.getLanguage = function () {
+            return language;
+        };
+
+        /**
+         * per language functions to use to determine the plural form
+         *
+         * @see    {@link https://docs.translatehouse.org/projects/localization-guide/en/latest/l10n/pluralforms.html}
+         * @name   I18n.getPluralForm
+         * @function
+         * @param  {int} n
+         * @return {int} array key
+         */
+        me.getPluralForm = function (n) { // eslint-disable-line complexity
+            switch (language) {
+                case 'ar':
+                    return n === 0 ? 0 : (n === 1 ? 1 : (n === 2 ? 2 : (n % 100 >= 3 && n % 100 <= 10 ? 3 : (n % 100 >= 11 ? 4 : 5))));
+                case 'cs':
+                case 'sk':
+                    return n === 1 ? 0 : (n >= 2 && n <= 4 ? 1 : 2);
+                case 'co':
+                case 'fa':
+                case 'fr':
+                case 'oc':
+                case 'tr':
+                case 'zh':
+                case 'zh-tw':
+                    return n > 1 ? 1 : 0;
+                case 'he':
+                    return n === 1 ? 0 : (n === 2 ? 1 : ((n < 0 || n > 10) && (n % 10 === 0) ? 2 : 3));
+                case 'id':
+                case 'ja':
+                case 'jbo':
+                case 'th':
+                    return 0;
+                case 'lt':
+                    return n % 10 === 1 && n % 100 !== 11 ? 0 : ((n % 10 >= 2 && n % 100 < 10 || n % 100 >= 20) ? 1 : 2);
+                case 'pl':
+                    return n === 1 ? 0 : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20) ? 1 : 2);
+                case 'ro':
+                    return n === 1 ? 0 : ((n === 0 || (n % 100 > 0 && n % 100 < 20)) ? 1 : 2);
+                case 'ru':
+                case 'uk':
+                    return n % 10 === 1 && n % 100 !== 11 ? 0 : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20) ? 1 : 2);
+                case 'sl':
+                    return n % 100 === 1 ? 1 : (n % 100 === 2 ? 2 : (n % 100 === 3 || n % 100 === 4 ? 3 : 0));
+                // bg, ca, de, el, en, es, et, fi, hu, it, nl, no, pt, sv
+                default:
+                    return n !== 1 ? 1 : 0;
+            }
+        };
+
+        /**
+         * load translations into cache
+         *
+         * @name   I18n.loadTranslations
+         * @function
+         */
+        me.loadTranslations = function () {
+            let newLanguage = Helper.getCookie('lang');
+
+            // auto-select language based on browser settings
+            if (newLanguage.length === 0) {
+                newLanguage = (navigator.language || navigator.userLanguage || 'en').toLowerCase();
+                const isTraditionalChinese = newLanguage.startsWith('zh-tw-') ||
+                    newLanguage === 'zh-hant' || newLanguage.startsWith('zh-hant-') ||
+                    newLanguage === 'zh-hk' || newLanguage.startsWith('zh-hk-') ||
+                    newLanguage === 'zh-mo' || newLanguage.startsWith('zh-mo-');
+                // alias Traditional Chinese browser tags to PrivateBin's zh-tw locale;
+                // otherwise try the full tag and fall back to the base language
+                if (isTraditionalChinese && supportedLanguages.includes('zh-tw')) {
+                    newLanguage = 'zh-tw';
+                } else if (!supportedLanguages.includes(newLanguage) && newLanguage.includes('-')) {
+                    newLanguage = newLanguage.split('-')[0];
+                }
+            }
+
+            // if language is already used skip update
+            if (newLanguage === language) {
+                return;
+            }
+
+            // if language is built-in (English) skip update
+            if (newLanguage === 'en') {
+                language = 'en';
+                return;
+            }
+
+            // if language is not supported, show error
+            if (!supportedLanguages.includes(newLanguage)) {
+                console.error('Language \'%s\' is not supported. Translation failed, fallback to English.', newLanguage);
+                language = 'en';
+                return;
+            }
+
+            // load strings from JSON
+            const scriptTag = document.querySelector('script[src^="js/privatebin.js"]');
+            const cacheBreaker = scriptTag ? (scriptTag.getAttribute('src').split('.js')[1] || '') : '';
+            fetch('i18n/' + newLanguage + '.json' + cacheBreaker)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('HTTP ' + response.status + ' ' + response.statusText);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    language = newLanguage;
+                    translations = Object.assign(Object.create(null), data);
+                    document.dispatchEvent(new CustomEvent(languageLoadedEvent));
+                })
+                .catch(error => {
+                    console.error(`Language \'${newLanguage}\' could not be loaded (${error.message}). Translation failed, fallback to English.`);
+                    language = 'en';
+                });
+        };
+
+        /**
+         * Register a callback to be invoked when translations have been loaded.
+         *
+         * This is useful for code that needs to re-apply translated strings to
+         * DOM attributes (e.g. title attributes) that cannot be handled by
+         * I18n.translate's built-in element re-translation mechanism (which only
+         * sets textContent/innerHTML).
+         *
+         * Note: If translations are already loaded when this is called, the
+         * callback will not be invoked. Callers should apply the translation
+         * immediately as well, to cover the case where the language is already
+         * available.
+         *
+         * @name   I18n.onLanguageLoaded
+         * @function
+         * @param     {function} callback - function to call when language is loaded
+         */
+        me.onLanguageLoaded = function (callback) {
+            document.addEventListener(languageLoadedEvent, callback);
+        };
+
+        /**
+         * resets state, used for unit testing
+         *
+         * @name   I18n.reset
+         * @function
+         */
+        me.reset = function (mockLanguage, mockTranslations) {
+            language = mockLanguage || null;
+            translations = mockTranslations || Object.create(null);
+        };
+
+        /**
+         * Check if string contains valid HTML code.
+         *
+         * If it is no string at all, this always returns false for compatibility.
+         *
+         * @name I18n.isStringContainsHtml
+         * @function
+         * @private
+         * @param {string|object} messageId
+         * @returns {boolean}
+         */
+        function isStringContainsHtml(messageId) {
+            // message IDs are allowed to contain anchors, spans, keyboard and emphasis tags
+            // we can recognize all of them by only checking for anchors and keyboard tags
+            return typeof messageId === 'string' && (messageId.includes('<a') || messageId.includes('<kbd'));
+        }
+
+        return me;
+    })();
+
+    /**
+     * handles everything related to en/decryption
+     *
+     * @name CryptTool
+     * @class
+     */
+    const CryptTool = (function () {
+        const me = {};
+
+        /**
+         * base58 encoder & decoder
+         *
+         * @private
+         */
+        const base58 = new baseX('123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz');
+
+        /**
+         * convert ArrayBuffer into a UTF-8 string
+         *
+         * Iterates over the bytes of the array, catenating them into a string
+         *
+         * @name   CryptTool.arraybufferToString
+         * @function
+         * @private
+         * @param  {ArrayBuffer} messageArray
+         * @return {string} message
+         */
+        function arraybufferToString(messageArray)
+        {
+            return Array.from(new Uint8Array(messageArray))
+                .map(byte => String.fromCharCode(byte))
+                .join('');
+        }
+
+        /**
+         * convert UTF-8 string into a Uint8Array
+         *
+         * Iterates over the bytes of the message, writing them to the array
+         *
+         * @name   CryptTool.stringToArraybuffer
+         * @function
+         * @private
+         * @param  {string} message UTF-8 string
+         * @return {Uint8Array} array
+         */
+        function stringToArraybuffer(message)
+        {
+            return Uint8Array.from(
+                message,
+                character => character.charCodeAt(0)
+            );
+        }
+
+        /**
+         * compress a string (deflate compression), returns buffer
+         *
+         * @name   CryptTool.compress
+         * @async
+         * @function
+         * @private
+         * @param  {string} message
+         * @param  {string} mode
+         * @param  {object} zlib
+         * @throws {string}
+         * @return {ArrayBuffer} data
+         */
+        async function compress(message, mode, zlib) {
+            message = new TextEncoder().encode(message);
+            if (mode === 'zlib') {
+                if (typeof zlib === 'undefined') {
+                    throw new Error('Error compressing document, due to missing WebAssembly support.');
+                }
+                return zlib.deflate(message).buffer;
+            }
+            return message;
+        }
+
+        /**
+         * decompress potentially base64 encoded, deflate compressed buffer, returns string
+         *
+         * @name   CryptTool.decompress
+         * @async
+         * @function
+         * @private
+         * @param  {ArrayBuffer} data
+         * @param  {string} mode
+         * @param  {object} zlib
+         * @throws {string}
+         * @return {string} message
+         */
+        async function decompress(data, mode, zlib) {
+            if (mode === 'zlib') {
+                if (typeof zlib === 'undefined') {
+                    throw new Error('Error decompressing document, your browser does not support WebAssembly. Please use another browser to view this document.');
+                }
+                data = zlib.inflate(
+                    new Uint8Array(data)
+                ).buffer;
+            }
+            return new TextDecoder('utf-8', {fatal: true}).decode(data);
+        }
+
+        /**
+         * returns specified number of random bytes
+         *
+         * @name   CryptTool.getRandomBytes
+         * @function
+         * @private
+         * @param  {int} length number of random bytes to fetch
+         * @throws {string}
+         * @return {string} random bytes
+         */
+        function getRandomBytes(length) {
+            let bytes = '';
+            const byteArray = new Uint8Array(length);
+            window.crypto.getRandomValues(byteArray);
+            for (let i = 0; i < length; ++i) {
+                bytes += String.fromCharCode(byteArray[i]);
+            }
+            return bytes;
+        }
+
+        /**
+         * derive cryptographic key from key string and password
+         *
+         * @name   CryptTool.deriveKey
+         * @async
+         * @function
+         * @private
+         * @param  {string} key
+         * @param  {string} password
+         * @param  {array}  spec cryptographic specification
+         * @return {CryptoKey} derived key
+         */
+        async function deriveKey(key, password, spec) {
+            let keyArray = stringToArraybuffer(key);
+            if (password.length > 0) {
+                let passwordArray = stringToArraybuffer(password),
+                    newKeyArray = new Uint8Array(keyArray.length + passwordArray.length);
+                newKeyArray.set(keyArray, 0);
+                newKeyArray.set(passwordArray, keyArray.length);
+                keyArray = newKeyArray;
+            }
+
+            // import raw key
+            const importedKey = await window.crypto.subtle.importKey(
+                'raw', // only 'raw' is allowed
+                keyArray,
+                { name: 'PBKDF2' }, // we use PBKDF2 for key derivation
+                false, // the key may not be exported
+                ['deriveKey'] // we may only use it for key derivation
+            ).catch(Alert.showError);
+
+            // derive a stronger key for use with AES
+            return window.crypto.subtle.deriveKey(
+                {
+                    name: 'PBKDF2', // we use PBKDF2 for key derivation
+                    salt: stringToArraybuffer(spec[1]), // salt used in HMAC
+                    iterations: spec[2], // amount of iterations to apply
+                    hash: { name: 'SHA-256' } // can be "SHA-1", "SHA-256", "SHA-384" or "SHA-512"
+                },
+                importedKey,
+                {
+                    name: 'AES-' + spec[6].toUpperCase(), // can be any supported AES algorithm ("AES-CTR", "AES-CBC", "AES-CMAC", "AES-GCM", "AES-CFB", "AES-KW", "ECDH", "DH" or "HMAC")
+                    length: spec[3] // can be 128, 192 or 256
+                },
+                false, // the key may not be exported
+                ['encrypt', 'decrypt'] // we may only use it for en- and decryption
+            ).catch(Alert.showError);
+        }
+
+        /**
+         * gets crypto settings from specification and authenticated data
+         *
+         * @name   CryptTool.cryptoSettings
+         * @function
+         * @private
+         * @param  {string} adata authenticated data
+         * @param  {array}  spec cryptographic specification
+         * @return {object} crypto settings
+         */
+        function cryptoSettings(adata, spec) {
+            return {
+                name: 'AES-' + spec[6].toUpperCase(), // can be any supported AES algorithm ("AES-CTR", "AES-CBC", "AES-CMAC", "AES-GCM", "AES-CFB", "AES-KW", "ECDH", "DH" or "HMAC")
+                iv: stringToArraybuffer(spec[0]), // the initialization vector you used to encrypt
+                additionalData: stringToArraybuffer(adata), // the addtional data you used during encryption (if any)
+                tagLength: spec[4] // the length of the tag you used to encrypt (if any)
+            };
+        }
+
+        /**
+         * compress, then encrypt message with given key and password
+         *
+         * @name   CryptTool.cipher
+         * @async
+         * @function
+         * @param  {string} key
+         * @param  {string} password
+         * @param  {string} message
+         * @param  {array}  adata
+         * @return {array}  encrypted message in base64 encoding & adata containing encryption spec
+         */
+        me.cipher = async function (key, password, message, adata) {
+            let zlib = (await z);
+            // AES in Galois Counter Mode, keysize 256 bit,
+            // authentication tag 128 bit, 10000 iterations in key derivation
+            const compression = (
+                typeof zlib === 'undefined' ?
+                    'none' : // client lacks support for WASM
+                    (document.body.dataset.compression || 'zlib')
+            ),
+                spec = [
+                    getRandomBytes(16), // initialization vector
+                    getRandomBytes(8),  // salt
+                    100000,             // iterations
+                    256,                // key size
+                    128,                // tag size
+                    'aes',              // algorithm
+                    'gcm',              // algorithm mode
+                    compression         // compression
+                ], encodedSpec = [];
+            for (let i = 0; i < spec.length; ++i) {
+                encodedSpec[i] = i < 2 ? btoa(spec[i]) : spec[i];
+            }
+            if (adata.length === 0) {
+                // comment
+                adata = encodedSpec;
+            } else if (adata[0] === null) {
+                // paste
+                adata[0] = encodedSpec;
+            }
+
+            // finally, encrypt message
+            return [
+                btoa(
+                    arraybufferToString(
+                        await window.crypto.subtle.encrypt(
+                            cryptoSettings(JSON.stringify(adata), spec),
+                            await deriveKey(key, password, spec),
+                            await compress(message, compression, zlib)
+                        ).catch(Alert.showError)
+                    )
+                ),
+                adata
+            ];
+        };
+
+        /**
+         * decrypt message with key, then decompress
+         *
+         * @name   CryptTool.decipher
+         * @async
+         * @function
+         * @param  {string} key
+         * @param  {string} password
+         * @param  {string|object} data encrypted message
+         * @return {string} decrypted message, empty if decryption failed
+         */
+        me.decipher = async function (key, password, data) {
+            let adataString, spec, cipherMessage, plaintext;
+            let zlib = (await z);
+            if (data instanceof Array) {
+                // version 2
+                adataString = JSON.stringify(data[1]);
+                // clone the array instead of passing the reference
+                spec = (data[1][0] instanceof Array ? data[1][0] : data[1]).slice();
+                cipherMessage = data[0];
+            } else {
+                throw 'unsupported message format';
+            }
+            spec[0] = atob(spec[0]);
+            spec[1] = atob(spec[1]);
+            if (spec[7] === 'zlib') {
+                if (typeof zlib === 'undefined') {
+                    throw 'Error decompressing document, your browser does not support WebAssembly. Please use another browser to view this document.';
+                }
+            }
+            try {
+                plaintext = await window.crypto.subtle.decrypt(
+                    cryptoSettings(adataString, spec),
+                    await deriveKey(key, password, spec),
+                    stringToArraybuffer(
+                        atob(cipherMessage)
+                    )
+                );
+            } catch (err) {
+                console.error(err);
+                return '';
+            }
+            try {
+                return await decompress(plaintext, spec[7], zlib);
+            } catch (err) {
+                Alert.showError(err);
+                return err;
+            }
+        };
+
+        /**
+         * returns a random symmetric key
+         *
+         * generates 256 bit long keys (8 Bits * 32) for AES with 256 bit long blocks
+         *
+         * @name   CryptTool.getSymmetricKey
+         * @function
+         * @throws {string}
+         * @return {string} raw bytes
+         */
+        me.getSymmetricKey = function () {
+            return getRandomBytes(32);
+        };
+
+        /**
+         * base58 encode a DOMString (UTF-16)
+         *
+         * @name   CryptTool.base58encode
+         * @function
+         * @param  {string} input
+         * @return {string} output
+         */
+        me.base58encode = function (input) {
+            return base58.encode(
+                stringToArraybuffer(input)
+            );
+        };
+
+        /**
+         * base58 decode a DOMString (UTF-16)
+         *
+         * @name   CryptTool.base58decode
+         * @function
+         * @param  {string} input
+         * @return {string} output
+         */
+        me.base58decode = function (input) {
+            return arraybufferToString(
+                base58.decode(input)
+            );
+        };
+
+        return me;
+    })();
+
+    /**
+     * (Model) Data source (aka MVC)
+     *
+     * @name   Model
+     * @class
+     */
+    const Model = (function () {
+        const me = {};
+
+        let id = null,
+            pasteData = null,
+            symmetricKey = null,
+            templates;
+
+        /**
+         * returns the expiration set in the HTML
+         *
+         * @name   Model.getExpirationDefault
+         * @function
+         * @return string
+         */
+        me.getExpirationDefault = function () {
+            const element = document.getElementById('pasteExpiration');
+            return element ? element.value : '';
+        };
+
+        /**
+         * returns the format set in the HTML
+         *
+         * @name   Model.getFormatDefault
+         * @function
+         * @return string
+         */
+        me.getFormatDefault = function () {
+            const element = document.getElementById('pasteFormatter');
+            return element ? element.value : '';
+        };
+
+        /**
+         * returns the document data (including the cipher data)
+         *
+         * @name   Model.getPasteData
+         * @function
+         * @param {function} callback (optional) Called when data is available
+         * @param {function} useCache (optional) Whether to use the cache or
+         *                            force a data reload. Default: true
+         * @return string
+         */
+        me.getPasteData = function (callback, useCache) {
+            // use cache if possible/allowed
+            if (useCache !== false && pasteData !== null) {
+                //execute callback
+                if (typeof callback === 'function') {
+                    return callback(pasteData);
+                }
+
+                // alternatively just using inline
+                return pasteData;
+            }
+
+            // reload data
+            ServerInteraction.prepare();
+            ServerInteraction.setUrl(Helper.baseUri() + '?pasteid=' + me.getPasteId());
+
+            ServerInteraction.setFailure(function (status, data) {
+                // revert loading status…
+                Alert.hideLoading();
+                TopNav.showViewButtons();
+
+                // show error message
+                Alert.showError(ServerInteraction.parseUploadError(status, data, 'get document data'));
+            });
+            ServerInteraction.setSuccess(function (status, data) {
+                pasteData = new Paste(data);
+
+                if (typeof callback === 'function') {
+                    return callback(pasteData);
+                }
+            });
+            ServerInteraction.run();
+        };
+
+        /**
+         * get the documents unique identifier from the URL,
+         * eg. https://example.com/path/?c05354954c49a487#dfdsdgdgdfgdf returns c05354954c49a487
+         *
+         * @name   Model.getPasteId
+         * @function
+         * @return {string} unique identifier
+         * @throws {string}
+         */
+        me.getPasteId = function () {
+            const idRegEx = /^[a-f0-9]{16}$/;
+
+            // return cached value
+            if (id !== null) {
+                return id;
+            }
+
+            // do use URL interface, if possible
+            const url = new URL(window.location);
+
+            for (const param of url.searchParams) {
+                const key = param[0];
+                const value = param[1];
+
+                if (value === '' && idRegEx.test(key)) {
+                    // safe, as the whole regex is matched
+                    id = key;
+                    return key;
+                }
+            }
+
+            if (id === null) {
+                throw 'no document id given';
+            }
+
+            return id;
+        };
+
+        /**
+         * returns true, when the URL has a delete token and the current call was used for deleting a document.
+         *
+         * @name   Model.hasDeleteToken
+         * @function
+         * @return {bool}
+         */
+        me.hasDeleteToken = function () {
+            return (new URL(window.location)).searchParams.has('deletetoken');
+        };
+
+        /**
+         * return the deciphering key stored in anchor part of the URL
+         *
+         * @name   Model.getPasteKey
+         * @function
+         * @return {string|null} key
+         * @throws {string}
+         */
+        me.getPasteKey = function () {
+            if (symmetricKey === null) {
+                let startPos = 1;
+                if (window.location.hash.startsWith(loadConfirmPrefix)) {
+                    startPos = loadConfirmPrefix.length;
+                }
+                let newKey = window.location.hash.substring(startPos);
+
+                // Some web 2.0 services and redirectors add data AFTER the anchor
+                // (such as &utm_source=...). We will strip any additional data.
+                let ampersandPos = newKey.indexOf('&');
+                if (ampersandPos > -1) {
+                    newKey = newKey.substring(0, ampersandPos);
+                }
+                if (newKey === '') {
+                    throw 'no encryption key given';
+                }
+
+                // version 2 uses base58, version 1 uses base64 without decoding
+                try {
+                    // base58 encode strips NULL bytes at the beginning of the
+                    // string, so we re-add them if necessary
+                    symmetricKey = CryptTool.base58decode(newKey).padStart(32, '\u0000');
+                } catch (e) {
+                    throw 'encryption key of unsupported format given or incomplete, mangled URL';
+                }
+            }
+
+            return symmetricKey;
+        };
+
+        /**
+         * returns a copy of the HTML template
+         *
+         * @name Model.getTemplate
+         * @function
+         * @param  {string} name - the name of the template
+         * @return {HTMLElement}
+         */
+        me.getTemplate = function (name) {
+            // find template
+            const template = document.getElementById(name + 'template');
+            if (!template || !templates.contains(template)) {
+                return null;
+            }
+            let element = template.cloneNode(true);
+            // change ID to avoid collisions (one ID should really be unique)
+            element.id = name;
+            return element;
+        };
+
+        /**
+         * resets state, used for unit testing
+         *
+         * @name   Model.reset
+         * @function
+         */
+        me.reset = function () {
+            pasteData = templates = id = symmetricKey = null;
+        };
+
+        /**
+         * init navigation manager
+         *
+         * preloads elements
+         *
+         * @name   Model.init
+         * @function
+         */
+        me.init = function () {
+            templates = document.getElementById('templates');
+        };
+
+        return me;
+    })();
+
+    /**
+     * Helper functions for user interface
+     *
+     * everything directly UI-related, which fits nowhere else
+     *
+     * @name   UiHelper
+     * @class
+     */
+    const UiHelper = (function () {
+        const me = {};
+
+        /**
+         * handle history (pop) state changes
+         *
+         * currently this does only handle redirects to the home page.
+         *
+         * @name   UiHelper.historyChange
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function historyChange(event) {
+            let currentLocation = Helper.baseUri();
+            if (event.originalEvent.state === null && // no state object passed
+                event.target.location.href === currentLocation && // target location is home page
+                window.location.href === currentLocation // and we are not already on the home page
+            ) {
+                // redirect to home page
+                window.location.href = currentLocation;
+            }
+        }
+
+        /**
+         * reload the page
+         *
+         * This takes the user to the PrivateBin homepage.
+         *
+         * @name   UiHelper.reloadHome
+         * @function
+         */
+        me.reloadHome = function () {
+            window.location.href = Helper.baseUri();
+        };
+
+
+        /**
+         * trigger a history (pop) state change
+         *
+         * used to test the UiHelper.historyChange private function
+         *
+         * @name   UiHelper.mockHistoryChange
+         * @function
+         * @param  {string} state   (optional) state to mock
+         */
+        me.mockHistoryChange = function (state) {
+            if (typeof state === 'undefined') {
+                state = null;
+            }
+            historyChange({ originalEvent: new PopStateEvent('popstate', { state: state }), target: window });
+        };
+
+        /**
+         * initialize
+         *
+         * @name   UiHelper.init
+         * @function
+         */
+        me.init = function () {
+            // update link to home page
+            document.querySelectorAll('.reloadlink').forEach(link => (link.href = Helper.baseUri()));
+
+            window.addEventListener('popstate', historyChange);
+        };
+
+        return me;
+    })();
+
+    /**
+     * Alert/error manager
+     *
+     * @name   Alert
+     * @class
+     */
+    const Alert = (function () {
+        const me = {};
+
+        let errorMessage,
+            loadingIndicator,
+            statusMessage,
+            remainingTime,
+            currentIcon,
+            customHandler;
+
+        const alertType = [
+            'loading', // not in bootstrap CSS, but using a plausible value here
+            'info',    // status icon
+            'warning', // warning icon
+            'danger'   // error icon
+        ];
+
+        /**
+         * forwards a request to the i18n module and shows the element
+         *
+         * @name   Alert.handleNotification
+         * @private
+         * @function
+         * @param  {number} id - id of notification
+         * @param  {HTMLElement} element - HTML element
+         * @param  {string|array} args
+         * @param  {string|null} icon - optional, icon
+         */
+        function handleNotification(id, element, args, icon) {
+            // basic parsing/conversion of parameters
+            if (typeof icon === 'undefined') {
+                icon = null;
+            }
+            if (typeof args === 'undefined') {
+                args = null;
+            } else if (typeof args === 'string') {
+                // convert string to array if needed
+                args = [args];
+            } else if (args instanceof Error) {
+                // extract message into array if needed
+                args = [args.message];
+            }
+
+            // function guard
+            if (!element) {
+                throw new TypeError(`invalid/no element (${element}) given for alert type ${alertType[id]} with ID ${id}`);
+            }
+
+            // pass to custom handler if defined
+            if (typeof customHandler === 'function') {
+                let handlerResult = customHandler(alertType[id], element, args, icon);
+                if (handlerResult === true) {
+                    // if it returns true, skip own handler
+                    return;
+                }
+                if (handlerResult instanceof HTMLElement) {
+                    // continue processing with new element
+                    element = handlerResult;
+                    icon = null; // icons not supported in this case
+                }
+            }
+            let translationTarget = element;
+
+            // handle icon, if template uses one
+            const glyphIcon = element.querySelector(':first-child');
+            if (glyphIcon) {
+                // if there is an icon, we need to provide an inner element
+                // to translate the message into, instead of the parent
+                translationTarget = document.createElement('span');
+                element.innerHTML = ' ';
+                element.prepend(glyphIcon);
+                element.appendChild(translationTarget);
+
+                if (icon !== null && // icon was passed
+                    icon !== currentIcon[id] // and it differs from current icon
+                ) {
+                    // remove (previous) icon
+                    glyphIcon.classList.remove(currentIcon[id]);
+
+                    // any other thing as a string (e.g. 'null') (only) removes the icon
+                    if (typeof icon === 'string') {
+                        // set new icon
+                        currentIcon[id] = 'glyphicon-' + icon;
+                        glyphIcon.classList.add(currentIcon[id]);
+                    }
+                }
+            }
+
+            // translate and insert message
+            I18n._(translationTarget, ...args);
+
+            // show element
+            element.classList.remove('hidden');
+        }
+
+        /**
+         * display a status message
+         *
+         * This automatically passes the text to I18n for translation.
+         *
+         * @name   Alert.showStatus
+         * @function
+         * @param  {string|array} message     string, use an array for %s/%d options
+         * @param  {string|null}  icon        optional, the icon to show,
+         *                                    default: leave previous icon
+         */
+        me.showStatus = function (message, icon) {
+            handleNotification(1, statusMessage, message, icon);
+        };
+
+        /**
+         * display a warning message
+         *
+         * This automatically passes the text to I18n for translation.
+         *
+         * @name   Alert.showWarning
+         * @function
+         * @param  {string|array} message     string, use an array for %s/%d options
+         * @param  {string|null}  icon        optional, the icon to show, default:
+         *                                    leave previous icon
+         */
+        me.showWarning = function (message, icon) {
+            const glyphIcon = errorMessage.querySelector(':first-child');
+            if (glyphIcon) {
+                glyphIcon.classList.remove(currentIcon[3]);
+                glyphIcon.classList.add(currentIcon[2]);
+            }
+            handleNotification(2, errorMessage, message, icon);
+        };
+
+        /**
+         * display an error message
+         *
+         * This automatically passes the text to I18n for translation.
+         *
+         * @name   Alert.showError
+         * @function
+         * @param  {string|array} message     string, use an array for %s/%d options
+         * @param  {string|null}  icon        optional, the icon to show, default:
+         *                                    leave previous icon
+         */
+        me.showError = function (message, icon) {
+            handleNotification(3, errorMessage, message, icon);
+        };
+
+        /**
+         * display remaining message
+         *
+         * This automatically passes the text to I18n for translation.
+         *
+         * @name   Alert.showRemaining
+         * @function
+         * @param  {string|array} message     string, use an array for %s/%d options
+         */
+        me.showRemaining = function (message) {
+            handleNotification(1, remainingTime, message);
+        };
+
+        /**
+         * shows a loading message, optionally with a percentage
+         *
+         * This automatically passes all texts to the i10s module.
+         *
+         * @name   Alert.showLoading
+         * @function
+         * @param  {string|array|null} message      optional, use an array for %s/%d options, default: 'Loading…'
+         * @param  {string|null}       icon         optional, the icon to show, default: leave previous icon
+         */
+        me.showLoading = function (message, icon) {
+            // default message text
+            if (typeof message === 'undefined') {
+                message = 'Loading…';
+            }
+
+            handleNotification(0, loadingIndicator, message, icon);
+
+            // show loading status (cursor)
+            document.body.classList.add('loading');
+        };
+
+        /**
+         * hides the loading message
+         *
+         * @name   Alert.hideLoading
+         * @function
+         */
+        me.hideLoading = function () {
+            loadingIndicator.classList.add('hidden');
+
+            // hide loading cursor
+            document.body.classList.remove('loading');
+        };
+
+        /**
+         * hides any status/error messages
+         *
+         * This does not include the loading message.
+         *
+         * @name   Alert.hideMessages
+         * @function
+         */
+        me.hideMessages = function () {
+            statusMessage.classList.add('hidden');
+            errorMessage.classList.add('hidden');
+        };
+
+        /**
+         * set a custom handler, which gets all notifications.
+         *
+         * This handler gets the following arguments:
+         * alertType (see array), $element, args, icon
+         * If it returns true, the own processing will be stopped so the message
+         * will not be displayed. Otherwise it will continue.
+         * As an aditional feature it can return a HTMLElement, which will
+         * then be used to add the message there. Icons are not supported in
+         * that case and will be ignored.
+         * Pass 'null' to reset/delete the custom handler.
+         * Note that there is no notification when a message is supposed to get
+         * hidden.
+         *
+         * @name   Alert.setCustomHandler
+         * @function
+         * @param {function|null} newHandler
+         */
+        me.setCustomHandler = function (newHandler) {
+            customHandler = newHandler;
+        };
+
+        /**
+         * init status manager
+         *
+         * preloads HTMLElements
+         *
+         * @name   Alert.init
+         * @function
+         */
+        me.init = function () {
+            // hide "no javascript" error message (guard in test environments)
+            const noscriptEl = document.getElementById('noscript');
+            if (noscriptEl) {
+                noscriptEl.style.display = 'none';
+            }
+
+            // not a reset, but first set of the elements
+            errorMessage = document.getElementById('errormessage');
+            loadingIndicator = document.getElementById('loadingindicator');
+            statusMessage = document.getElementById('status');
+            remainingTime = document.getElementById('remainingtime');
+
+            currentIcon = [
+                'glyphicon-time', // loading icon
+                'glyphicon-info-sign', // status icon
+                'glyphicon-warning-sign', // warning icon
+                'glyphicon-alert' // error icon
+            ];
+        };
+
+        return me;
+    })();
+
+    /**
+     * handles paste status/result
+     *
+     * @name   PasteStatus
+     * @class
+     */
+    const PasteStatus = (function () {
+        const me = {};
+
+        let pasteSuccess,
+            pasteUrl,
+            remainingTime,
+            shortenButton;
+
+        /**
+         * forward to URL shortener
+         *
+         * @name   PasteStatus.sendToShortener
+         * @private
+         * @function
+         */
+        function sendToShortener() {
+            if (shortenButton.classList.contains('buttondisabled')) {
+                return;
+            }
+            fetch(`${shortenButton.dataset.shortener}${encodeURIComponent(pasteUrl.href)}`, {
+                method: 'GET',
+                headers: { 'Accept': 'text/html, application/xhtml+xml, application/xml, application/json' },
+                credentials: 'omit',
+                signal: AbortSignal.timeout(10000)
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('HTTP ' + response.status);
+                    }
+                    return response.text();
+                })
+                .then(data => PasteStatus.extractUrl(data))
+                .catch(error => {
+                    console.error('Shortener error:', error);
+                    // we don't know why it failed, could be CORS of the external
+                    // server not setup properly, in which case we follow old
+                    // behavior to open it in new tab
+                    window.open(
+                        `${shortenButton.dataset.shortener}${encodeURIComponent(pasteUrl.href)}`,
+                        '_blank',
+                        'noopener, noreferrer'
+                    );
+                });
+        }
+
+        /**
+         * Forces opening the document if the link does not do this automatically.
+         *
+         * This is necessary as browsers will not reload the page when it is
+         * already loaded (which is fake as it is set via history.pushState()).
+         *
+         * @name   PasteStatus.pasteLinkClick
+         * @function
+         */
+        function pasteLinkClick() {
+            // check if location is (already) shown in URL bar
+            if (window.location.href === pasteUrl.href) {
+                // if so we need to load link by reloading the current site
+                window.location.reload(true);
+            }
+        }
+
+        /**
+         * creates a notification after a successful document upload
+         *
+         * @name   PasteStatus.createPasteNotification
+         * @function
+         * @param  {string} url
+         * @param  {string} deleteUrl
+         */
+        me.createPasteNotification = function(url, deleteUrl)
+        {
+            const ua = navigator.userAgent;
+            const isMac = /Mac/.test(ua);
+            const hotkey = isMac ? I18n._('Cmd') : I18n._('Ctrl');
+            I18n._(
+                document.getElementById('pastelink'),
+                'Your document is <a id="pasteurl" href="%s">%s</a> <span id="copyhint">(Hit <kbd>%s</kbd>+<kbd>c</kbd> to copy)</span>',
+                url, url, hotkey
+            );
+            // save newly created element
+            pasteUrl = document.getElementById('pasteurl');
+            // and add click event
+            if (pasteUrl) {
+                pasteUrl.addEventListener('click', pasteLinkClick);
+            }
+
+            // delete link
+            const deleteLink = document.getElementById('deletelink');
+            if (deleteLink) {
+                deleteLink.href = deleteUrl;
+            }
+            I18n._(document.querySelector('#deletelink span:not(.glyphicon)'), 'Delete data');
+
+            // enable shortener button
+            if (shortenButton) {
+                shortenButton.classList.remove('buttondisabled');
+            }
+
+            // show result
+            if (pasteSuccess) {
+                pasteSuccess.classList.remove('hidden');
+            }
+            // we pre-select the link so that the user only has to [Ctrl]+[c] the link
+            Helper.selectText(pasteUrl);
+        };
+
+        /**
+         * Checks if auto-shortening is enabled and sends the link to the shortener if it is.
+         *
+         * @name  PasteStatus.checkAutoShorten
+         * @function
+         */
+        me.checkAutoShorten = function () {
+            // check if auto-shortening is enabled
+            if (shortenButton && shortenButton.dataset.autoshorten === 'true') {
+                // if so, we send the link to the shortener
+                // we do not remove the button, in case shortener fails
+                sendToShortener();
+            }
+        };
+
+        /**
+         * extracts URLs from given string
+         *
+         * if at least one is found, it disables the shortener button and
+         * replaces the document URL
+         *
+         * @name   PasteStatus.extractUrl
+         * @function
+         * @param  {string} response
+         */
+        me.extractUrl = function (response) {
+            if (typeof response === 'object') {
+                response = JSON.stringify(response);
+            }
+            if (typeof response === 'string' && response.length > 0) {
+                const shortUrlMatcher = /https?:\/\/[^\s"<]+/g; // JSON API will have URL in quotes, XML in tags
+                const shortUrl = (response.match(shortUrlMatcher) || []).filter(function (urlRegExMatch) {
+                    if (typeof URL.canParse === 'function') {
+                        return URL.canParse(urlRegExMatch);
+                    }
+                    // polyfill for older browsers (< 120) & node (< 19.9 & < 18.17)
+                    try {
+                        return !!new URL(urlRegExMatch);
+                    } catch (error) {
+                        return false;
+                    }
+                }).sort(function (a, b) {
+                    return a.length - b.length; // shortest first
+                })[0];
+                if (typeof shortUrl === 'string' && shortUrl.length > 0) {
+                    // we disable the button to avoid calling shortener again
+                    if (shortenButton) {
+                        shortenButton.classList.add('buttondisabled');
+                    }
+                    // update link
+                    pasteUrl.textContent = shortUrl;
+                    pasteUrl.href = shortUrl;
+                    // we pre-select the link so that the user only has to [Ctrl]+[c] the link
+                    Helper.selectText(pasteUrl);
+                    CopyToClipboard.setUrl(shortUrl);
+                    return;
+                }
+            }
+            Alert.showError('Cannot parse response from URL shortener.');
+        };
+
+        /**
+         * shows the remaining time
+         *
+         * @name PasteStatus.showRemainingTime
+         * @function
+         * @param {Paste} paste
+         */
+        me.showRemainingTime = function (paste) {
+            if (paste.isBurnAfterReadingEnabled()) {
+                // display document "for your eyes only" if it is deleted
+
+                // the document has been deleted when the JSON with the ciphertext
+                // has been downloaded
+
+                Alert.showRemaining('FOR YOUR EYES ONLY. Don\'t close this window, this message can\'t be displayed again.');
+                remainingTime.classList.add('foryoureyesonly');
+            } else if (paste.getTimeToLive() > 0) {
+                // display document expiration
+                let expiration = Helper.secondsToHuman(paste.getTimeToLive()),
+                    expirationLabel = [
+                        'This document will expire in %d ' + expiration[1] + '.',
+                        'This document will expire in %d ' + expiration[1] + 's.'
+                    ];
+
+                Alert.showRemaining([expirationLabel, expiration[0]]);
+                remainingTime.classList.remove('foryoureyesonly');
+            } else {
+                // never expires
+                return;
+            }
+
+            // in the end, display notification
+            remainingTime.classList.remove('hidden');
+        };
+
+        /**
+         * hides the remaining time and successful upload notification
+         *
+         * @name PasteStatus.hideMessages
+         * @function
+         */
+        me.hideMessages = function () {
+            remainingTime.classList.add('hidden');
+            pasteSuccess.classList.add('hidden');
+        };
+
+        /**
+         * init status manager
+         *
+         * preloads HTMLElements
+         *
+         * @name   PasteStatus.init
+         * @function
+         */
+        me.init = function () {
+            pasteSuccess = document.getElementById('pastesuccess');
+            // pasteUrl is saved in me.createPasteNotification() after creation
+            remainingTime = document.getElementById('remainingtime');
+            shortenButton = document.getElementById('shortenbutton');
+
+            // bind elements
+            if (shortenButton) {
+                shortenButton.addEventListener('click', sendToShortener);
+            }
+        };
+
+        return me;
+    })();
+
+    /**
+     * password prompt
+     *
+     * @name Prompt
+     * @class
+     */
+    const Prompt = (function () {
+        const me = {};
+
+        let passwordDecrypt,
+            passwordModal,
+            bootstrap5PasswordModal = null,
+            password = '';
+
+        /**
+         * submit a password in the modal dialog
+         *
+         * @name Prompt.submitPasswordModal
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function submitPasswordModal(event) {
+            event.preventDefault();
+
+            // get input
+            password = passwordDecrypt.value;
+
+            // hide modal
+            if (bootstrap5PasswordModal) {
+                bootstrap5PasswordModal.hide();
+            } else {
+                if (passwordModal) {
+                    passwordModal.classList.remove('show');
+                    passwordModal.style.display = 'none';
+                }
+            }
+
+            PasteDecrypter.run();
+        }
+
+        /**
+         * Request users confirmation to load possibly burn after reading document
+         *
+         * @name   Prompt.requestLoadConfirmation
+         * @function
+         */
+        me.requestLoadConfirmation = function () {
+            const loadconfirmmodal = document.getElementById('loadconfirmmodal');
+
+            const loadconfirmOpenNow = loadconfirmmodal.querySelector('#loadconfirm-open-now');
+            loadconfirmOpenNow.removeEventListener('click', PasteDecrypter.run);
+            loadconfirmOpenNow.addEventListener('click', PasteDecrypter.run);
+
+            const loadconfirmClose = loadconfirmmodal.querySelector('.btn-close');
+            loadconfirmClose.removeEventListener('click', Controller.newPaste);
+            loadconfirmClose.addEventListener('click', Controller.newPaste);
+
+            loadconfirmmodal.addEventListener('shown.bs.modal', () => {
+                loadconfirmOpenNow.focus();
+            });
+
+            if (typeof bootstrap !== 'undefined' && bootstrap.Tooltip && typeof bootstrap.Modal === 'function') {
+                (new bootstrap.Modal(loadconfirmmodal)).show();
+            } else {
+                // minimal fallback: make element visible
+                loadconfirmmodal.classList.add('show');
+            }
+        };
+
+        /**
+         * ask the user for the password and set it
+         *
+         * @name Prompt.requestPassword
+         * @function
+         */
+        me.requestPassword = function () {
+            // show new bootstrap method (if available)
+            if (passwordModal !== null) {
+                if (bootstrap5PasswordModal) {
+                    bootstrap5PasswordModal.show();
+                }
+                return;
+            }
+
+            PasteDecrypter.run();
+        };
+
+        /**
+         * get the cached password
+         *
+         * If you do not get a password with this function
+         * (returns an empty string), use requestPassword.
+         *
+         * @name   Prompt.getPassword
+         * @function
+         * @return {string}
+         */
+        me.getPassword = function () {
+            return password;
+        };
+
+        /**
+         * resets the password to an empty string
+         *
+         * @name   Prompt.reset
+         * @function
+         */
+        me.reset = function () {
+            // reset internal
+            password = '';
+
+            // and also reset UI
+            passwordDecrypt.value = '';
+        };
+
+        /**
+         * init status manager
+         *
+         * preloads HTMLElements
+         *
+         * @name   Prompt.init
+         * @function
+         */
+        me.init = function () {
+            passwordDecrypt = document.getElementById('passworddecrypt');
+            passwordModal = document.getElementById('passwordmodal');
+
+            // bind events - handle Model password submission
+            if (passwordModal) {
+                const passwordForm = document.getElementById('passwordform');
+                if (passwordForm) {
+                    passwordForm.addEventListener('submit', submitPasswordModal);
+                }
+
+                const disableClosingConfig = {
+                    backdrop: 'static',
+                    keyboard: false,
+                    show: false
+                };
+                if (typeof bootstrap !== 'undefined' && bootstrap.Tooltip && typeof bootstrap.Modal === 'function') {
+                    bootstrap5PasswordModal = new bootstrap.Modal(passwordModal, disableClosingConfig);
+                } else {
+                    // fallback: keep modal hidden until explicitly shown
+                    passwordModal.style.display = 'none';
+                }
+
+                // ensure focus when modal shown (works for bootstrap5)
+                passwordModal.addEventListener('shown.bs.modal', () => {
+                    passwordDecrypt.focus();
+                });
+            }
+        };
+
+        return me;
+    })();
+
+    /**
+     * Manage paste/message input, and preview tab
+     *
+     * Note that the actual preview is handled by PasteViewer.
+     *
+     * @name   Editor
+     * @class
+     */
+    const Editor = (function () {
+        const me = {};
+
+        let editorTabs,
+            messageEdit,
+            messageEditParent,
+            messagePreview,
+            messagePreviewParent,
+            messageTab,
+            messageTabParent,
+            message,
+            isPreview = false,
+            isTabSupported = true;
+
+        /**
+         * support input of tab character
+         *
+         * @name   Editor.supportTabs
+         * @function
+         * @param  {KeyboardEvent} event
+         * @this message
+         */
+        function supportTabs(event) {
+            // support disabling tab support using [Esc] and [Ctrl]+[m]
+            if (event.key === 'Escape' || (event.ctrlKey && event.key === 'm')) {
+                toggleTabSupport();
+                if (messageTab) messageTab.checked = isTabSupported;
+                event.preventDefault();
+            }
+            else if (isTabSupported && event.key === 'Tab') {
+                // get caret position & selection
+                const val = this.value,
+                    start = this.selectionStart,
+                    end = this.selectionEnd;
+                // set textarea value to: text before caret + tab + text after caret
+                this.value = val.substring(0, start) + '\t' + val.substring(end);
+                // put caret at right position again
+                this.selectionStart = this.selectionEnd = start + 1;
+                // prevent the textarea to lose focus
+                event.preventDefault();
+            }
+        }
+
+        /**
+         * toggle tab support in message textarea
+         *
+         * @name   Editor.toggleTabSupport
+         * @private
+         * @function
+         */
+        function toggleTabSupport() {
+            isTabSupported = !isTabSupported;
+        }
+
+        /**
+         * view the Editor tab
+         *
+         * @name   Editor.viewEditor
+         * @function
+         * @param  {Event} event - optional
+         */
+        function viewEditor(event) {
+            // toggle buttons
+            messageEdit.classList.add('active');
+            messageEditParent.classList.add('active');
+            messagePreview.classList.remove('active');
+            messagePreviewParent.classList.remove('active');
+
+            messageEdit.setAttribute('aria-selected', 'true');
+            messagePreview.setAttribute('aria-selected', 'false');
+
+            PasteViewer.hide();
+
+            // reshow input
+            message.classList.remove('hidden');
+            messageTabParent.classList.remove('hidden');
+
+            me.focusInput();
+
+            // finish
+            isPreview = false;
+
+            // prevent jumping of page to top
+            if (typeof event !== 'undefined') {
+                event.preventDefault();
+            }
+        }
+
+        /**
+         * view the preview tab
+         *
+         * @name   Editor.viewPreview
+         * @function
+         * @param  {Event} event
+         */
+        function viewPreview(event) {
+            // toggle buttons
+            messageEdit.classList.remove('active');
+            messageEditParent.classList.remove('active');
+            messagePreview.classList.add('active');
+            messagePreviewParent.classList.add('active');
+
+            messageEdit.setAttribute('aria-selected', 'false');
+            messagePreview.setAttribute('aria-selected', 'true');
+
+            // hide input as now preview is shown
+            message.classList.add('hidden');
+            messageTabParent.classList.add('hidden');
+
+            // show preview
+            PasteViewer.setText(message.value);
+            if (AttachmentViewer.hasAttachmentData()) {
+                const attachmentsData = AttachmentViewer.getAttachmentsData();
+
+                attachmentsData.forEach(attachmentData => {
+                    const mimeType = AttachmentViewer.getAttachmentMimeType(attachmentData);
+
+                    AttachmentViewer.handleBlobAttachmentPreview(
+                        AttachmentViewer.getAttachmentPreview(),
+                        attachmentData, mimeType
+                    );
+                });
+
+                AttachmentViewer.showAttachment();
+            }
+            PasteViewer.run();
+
+            // finish
+            isPreview = true;
+
+            // prevent jumping of page to top
+            if (typeof event !== 'undefined') {
+                event.preventDefault();
+            }
+        }
+
+        /**
+         * get the state of the preview
+         *
+         * @name   Editor.isPreview
+         * @function
+         */
+        me.isPreview = function () {
+            return isPreview;
+        };
+
+        /**
+         * reset the Editor view
+         *
+         * @name   Editor.resetInput
+         * @function
+         */
+        me.resetInput = function () {
+            // go back to input
+            if (isPreview) {
+                viewEditor();
+            }
+
+            // clear content
+            message.value = '';
+        };
+
+        /**
+         * shows the Editor
+         *
+         * @name   Editor.show
+         * @function
+         */
+        me.show = function () {
+            message.classList.remove('hidden');
+            messageTabParent.classList.remove('hidden');
+            editorTabs.classList.remove('hidden');
+        };
+
+        /**
+         * hides the Editor
+         *
+         * @name   Editor.hide
+         * @function
+         */
+        me.hide = function () {
+            message.classList.add('hidden');
+            messageTabParent.classList.add('hidden');
+            editorTabs.classList.add('hidden');
+        };
+
+        /**
+         * focuses the message input
+         *
+         * @name   Editor.focusInput
+         * @function
+         */
+        me.focusInput = function () {
+            message.focus();
+        };
+
+        /**
+         * sets a new text
+         *
+         * @name   Editor.setText
+         * @function
+         * @param {string} newText
+         */
+        me.setText = function (newText) {
+            message.value = newText;
+        };
+
+        /**
+         * returns the current text
+         *
+         * @name   Editor.getText
+         * @function
+         * @return {string}
+         */
+        me.getText = function () {
+            return message.value;
+        };
+
+        /**
+         * init editor
+         *
+         * preloads HTMLElements and binds events
+         *
+         * @name   Editor.init
+         * @function
+         */
+        me.init = function () {
+            editorTabs = document.getElementById('editorTabs');
+            message = document.getElementById('message');
+            messageTab = document.getElementById('messagetab');
+            messageTabParent = messageTab ? messageTab.parentElement : null;
+
+            // bind events
+            if (message) {
+                message.addEventListener('keydown', supportTabs);
+            }
+            if (messageTab) {
+                messageTab.addEventListener('change', toggleTabSupport);
+            }
+
+            // bind click events to tab switchers (a), and save parents (li)
+            messageEdit = document.getElementById('messageedit');
+            if (messageEdit) {
+                messageEdit.addEventListener('click', viewEditor);
+                messageEditParent = messageEdit.parentElement;
+            }
+            messagePreview = document.getElementById('messagepreview');
+            if (messagePreview) {
+                messagePreview.addEventListener('click', viewPreview);
+                messagePreviewParent = messagePreview.parentElement;
+            }
+        };
+
+        return me;
+    })();
+
+    /**
+     * (view) Parse and show document.
+     *
+     * @name   PasteViewer
+     * @class
+     */
+    const PasteViewer = (function () {
+        const me = {};
+
+        let messageTabParent,
+            placeholder,
+            prettyMessage,
+            prettyPrintEl,
+            plainText,
+            text,
+            format = 'plaintext',
+            isDisplayed = false,
+            isChanged = true; // by default true as nothing was parsed yet
+
+        /**
+         * apply the set format on paste and displays it
+         *
+         * @name   PasteViewer.parsePaste
+         * @private
+         * @function
+         */
+        function parsePaste() {
+            // skip parsing if no text is given
+            if (text === '') {
+                return;
+            }
+
+            if (format === 'markdown') {
+                const converter = new showdown.Converter({
+                    strikethrough: true,
+                    tables: true,
+                    tablesHeaderId: true,
+                    simplifiedAutoLink: true,
+                    excludeTrailingPunctuationFromURLs: true
+                });
+                // let showdown convert the HTML and sanitize HTML *afterwards*!
+                if (plainText) {
+                    plainText.innerHTML = DOMPurify.sanitize(
+                        converter.makeHtml(text),
+                        purifyHtmlConfig
+                    );
+                    // add table classes from bootstrap css
+                    plainText.querySelectorAll('table').forEach(t => {
+                        t.classList.add('table-condensed', 'table-bordered');
+                    });
+                }
+            } else {
+                if (format === 'syntaxhighlighting') {
+                    // yes, this is really needed to initialize the environment
+                    if (typeof prettyPrint === 'function') {
+                        prettyPrint();
+                    }
+
+                    if (prettyPrintEl) {
+                        prettyPrintEl.innerHTML = prettyPrintOne(
+                            Helper.htmlEntities(text), null, true
+                        );
+                    }
+                } else {
+                    // = 'plaintext'
+                    if (prettyPrintEl) {
+                        prettyPrintEl.textContent = text;
+                    }
+                }
+                if (prettyPrintEl) {
+                    Helper.urls2links(prettyPrintEl, format !== 'syntaxhighlighting');
+                    prettyPrintEl.style.whiteSpace = 'pre-wrap';
+                    prettyPrintEl.style.wordBreak = 'normal';
+                    prettyPrintEl.classList.remove('prettyprint', 'prettyprinted');
+                }
+            }
+        }
+
+        /**
+         * displays the document
+         *
+         * NOTE: FOr some obscure reaosn, Markdown is shown in the "plaintext" class
+         * and all other ones are rendered in the "prettyPrintEl" one.
+         *
+         * @name   PasteViewer.showPaste
+         * @private
+         * @function
+         */
+        function showPaste() {
+            // instead of "nothing" better display a placeholder
+            if (text === '') {
+                if (placeholder) placeholder.classList.remove('hidden');
+                return;
+            }
+            // otherwise hide the placeholder
+            if (placeholder) placeholder.classList.add('hidden');
+            if (messageTabParent) messageTabParent.classList.add('hidden');
+
+            if (format === 'markdown') {
+                if (plainText) plainText.classList.remove('hidden');
+                if (prettyMessage) prettyMessage.classList.add('hidden');
+            } else {
+                if (plainText) plainText.classList.add('hidden');
+                if (prettyMessage) prettyMessage.classList.remove('hidden');
+            }
+        }
+
+        /**
+         * sets the format in which the text is shown
+         *
+         * @name   PasteViewer.setFormat
+         * @function
+         * @param {string} newFormat the new format
+         */
+        me.setFormat = function (newFormat) {
+            // skip if there is no update
+            if (format === newFormat) {
+                return;
+            }
+
+            // needs to update display too, if we switch from or to Markdown
+            if (format === 'markdown' || newFormat === 'markdown') {
+                isDisplayed = false;
+            }
+
+            format = newFormat;
+            isChanged = true;
+
+            // update preview
+            if (Editor.isPreview()) {
+                PasteViewer.run();
+            }
+        };
+
+        /**
+         * returns the current format
+         *
+         * @name   PasteViewer.getFormat
+         * @function
+         * @return {string}
+         */
+        me.getFormat = function () {
+            return format;
+        };
+
+        /**
+         * returns whether the current view is pretty printed
+         *
+         * @name   PasteViewer.isPrettyPrinted
+         * @function
+         * @return {bool}
+         */
+        me.isPrettyPrinted = function () {
+            return prettyPrintEl ? prettyPrintEl.classList.contains('prettyprinted') : false;
+        };
+
+        /**
+         * sets the text to show
+         *
+         * @name   PasteViewer.setText
+         * @function
+         * @param {string} newText the text to show
+         */
+        me.setText = function (newText) {
+            if (text !== newText) {
+                text = newText;
+                isChanged = true;
+            }
+        };
+
+        /**
+         * gets the current cached text
+         *
+         * @name   PasteViewer.getText
+         * @function
+         * @return {string}
+         */
+        me.getText = function () {
+            return text;
+        };
+
+        /**
+         * show/update the parsed text (preview)
+         *
+         * @name   PasteViewer.run
+         * @function
+         */
+        me.run = function () {
+            if (isChanged) {
+                parsePaste();
+                isChanged = false;
+            }
+
+            if (!isDisplayed) {
+                showPaste();
+                isDisplayed = true;
+            }
+        };
+
+        /**
+         * hide parsed text (preview)
+         *
+         * @name   PasteViewer.hide
+         * @function
+         */
+        me.hide = function () {
+            if (!isDisplayed) {
+                return;
+            }
+
+            if (plainText) plainText.classList.add('hidden');
+            if (prettyMessage) prettyMessage.classList.add('hidden');
+            if (placeholder) placeholder.classList.add('hidden');
+            AttachmentViewer.hideAttachmentPreview();
+
+            isDisplayed = false;
+        };
+
+        /**
+         * init status manager
+         *
+         * preloads DOM elements
+         *
+         * @name   PasteViewer.init
+         * @function
+         */
+        me.init = function () {
+            const messagetab = document.getElementById('messagetab');
+            messageTabParent = messagetab ? messagetab.parentElement : null;
+            placeholder = document.getElementById('placeholder');
+            plainText = document.getElementById('plaintext');
+            prettyMessage = document.getElementById('prettymessage');
+            prettyPrintEl = document.getElementById('prettyprint');
+
+            // get default option from template/HTML or fall back to set value
+            format = Model.getFormatDefault() || format;
+            text = '';
+            isDisplayed = false;
+            isChanged = true;
+        };
+
+        return me;
+    })();
+
+    /**
+     * (view) Show attachment and preview if possible
+     *
+     * @name   AttachmentViewer
+     * @class
+     */
+    const AttachmentViewer = (function () {
+        const me = {};
+
+        let attachmentPreview,
+            attachment,
+            attachmentsData = [],
+            files,
+            fileInput,
+            dragAndDropFileNames,
+            dropzone;
+
+        /**
+         * get blob URL from string data and mime type
+         *
+         * @name   AttachmentViewer.getBlobUrl
+         * @private
+         * @function
+         * @param {string} data - raw data of attachment
+         * @param {string} data - mime type of attachment
+         * @return {string} objectURL
+         */
+        function getBlobUrl(data, mimeType) {
+            // Transform into a Blob
+            const buf = Uint8Array.from(
+                data,
+                character => character.charCodeAt(0)
+            );
+            const blob = new window.Blob(
+                [buf],
+                {
+                    type: mimeType
+                }
+            );
+
+            // Get blob URL
+            return window.URL.createObjectURL(blob);
+        }
+
+        /**
+        * sets the attachment but does not yet show it
+        *
+        * @name   AttachmentViewer.setAttachment
+        * @function
+        * @param {string} attachmentData - base64-encoded data of file
+        * @param {string} fileName - optional, file name
+        */
+        me.setAttachment = function (attachmentData, fileName) {
+            // skip, if attachments got disabled
+            if (!attachment) return;
+
+            // data URI format: data:[<mimeType>][;base64],<data>
+
+            const template = Model.getTemplate('attachment');
+            const attachmentLink = template.querySelector('a');
+
+            // position in data URI string of where data begins
+            const base64Start = attachmentData.indexOf(',') + 1;
+
+            const mimeType = me.getAttachmentMimeType(attachmentData);
+
+            // We explicitly do _not_ use the original mime type for the download link
+            // to always force a download instead of potentially dangerous browser rendering/parsing/interpretation
+            let sanitizedMimeType = 'application/octet-stream';
+            if (me.isSafeMimeType(mimeType)) {
+                sanitizedMimeType = mimeType;
+            }
+
+            // extract data and convert to binary
+            const base64Data = attachmentData.substring(base64Start);
+            const plainData = base64Data.length > 0 ? atob(base64Data) : '';
+
+            let blobUrl = getBlobUrl(plainData, sanitizedMimeType);
+            attachmentLink.setAttribute('href', blobUrl);
+
+            if (typeof fileName !== 'undefined') {
+                attachmentLink.setAttribute('download', fileName);
+
+                const fileSize = Helper.formatBytes(plainData.length);
+                const spans = template.querySelectorAll('span');
+                const span = spans[spans.length - 1];
+                span.textContent += ` (${fileName}, ${fileSize})`;
+            }
+
+            // sanitize SVG preview
+            // prevents executing embedded scripts when CSP is not set and user
+            // right-clicks/long-taps and opens the SVG in a new tab - prevented
+            // in the preview by use of an img tag, which disables scripts, too
+            if (mimeType.startsWith('image/svg')) {
+                try {
+                    // attempt to UTF-8 decode the SVG data
+                    const svgBuffer = Uint8Array.from(
+                        plainData,
+                        character => character.charCodeAt(0)
+                    );
+                    const utf8ValidatedSvgString = new TextDecoder(
+                        'utf-8',
+                        {fatal: true}
+                    ).decode(svgBuffer);
+                    const sanitizedData = DOMPurify.sanitize(
+                        utf8ValidatedSvgString,
+                        purifySvgConfig
+                    );
+                    sanitizedMimeType = 'image/svg+xml';
+                    blobUrl = getBlobUrl(sanitizedData, sanitizedMimeType);
+                } catch (e) {
+                    // Invalid or non-UTF-8 SVG: download only, no preview as it
+                    // may be used to smuggle multi-byte sequences past DOMpurify
+                    // such as `&#x13c` to get `\x01<` & `&#x13e` to get `\x01>`
+                    sanitizedMimeType = 'application/octet-stream';
+                    blobUrl = getBlobUrl(plainData, sanitizedMimeType);
+                }
+            }
+
+            template.classList.remove('hidden');
+            attachment.appendChild(template);
+
+            me.handleBlobAttachmentPreview(attachmentPreview, blobUrl, sanitizedMimeType);
+        };
+
+
+
+        /**
+         * Evaluates whether this is known a safe mime type.
+         *
+         * This means, the media can safely be displayed and e.g. no XSS should be possible.
+         *
+         * @name AttachmentViewer.isSafeMimeType
+         * @function
+         * @param {string}
+         * @returns {bool}
+         */
+        me.isSafeMimeType = function(mimeType) {
+            return ((
+                    mimeType.startsWith('image/') &&
+                    !/svg/i.test(mimeType)
+                ) ||
+                mimeType.startsWith('video/') ||
+                mimeType.startsWith('audio/') ||
+                mimeType === 'application/pdf' ||
+                mimeType === 'text/plain') &&
+                // don't accept comments, stray characters, spaces, etc.
+                /^[a-z0-9][a-z0-9.-]*[a-z0-9]\/[a-z0-9][a-z0-9.+-]*[a-z0-9]$/.test(mimeType);
+        };
+
+        /**
+         * displays the attachment and (if possible) the preview
+         *
+         * @name AttachmentViewer.showAttachment
+         * @function
+         */
+        me.showAttachment = function () {
+            if (!attachment) {
+                return;
+            }
+
+            attachment.classList.remove('hidden');
+
+            if (attachmentPreview && me.hasAttachmentPreview()) {
+                attachmentPreview.classList.remove('hidden');
+            }
+        };
+
+        /**
+         * removes the attachment
+         *
+         * This automatically hides the attachment containers too, to
+         * prevent an inconsistent display.
+         *
+         * @name AttachmentViewer.removeAttachment
+         * @function
+         */
+        me.removeAttachment = function () {
+            if (!attachment) {
+                return;
+            }
+            me.hideAttachment();
+            me.hideAttachmentPreview();
+            attachment.innerHTML = '';
+            if (attachmentPreview) {
+                attachmentPreview.innerHTML = '';
+            }
+            me.clearDragAndDrop();
+
+            AttachmentViewer.removeAttachmentData();
+        };
+
+        /**
+         * removes the attachment data
+         *
+         * This removes the data, which would be uploaded otherwise.
+         *
+         * @name AttachmentViewer.removeAttachmentData
+         * @function
+         */
+        me.removeAttachmentData = function () {
+            files = [];
+            attachmentsData = [];
+        };
+
+        /**
+         * Cleares the drag & drop data.
+         *
+         * @name AttachmentViewer.clearDragAndDrop
+         * @function
+         */
+        me.clearDragAndDrop = function () {
+            if (dragAndDropFileNames) {
+                dragAndDropFileNames.innerHTML = '';
+            }
+        };
+
+        /**
+         * Print file names added via drag & drop
+         *
+         * @name AttachmentViewer.printDragAndDropFileNames
+         * @private
+         * @function
+         * @param {string[]} fileNames
+         */
+        function printDragAndDropFileNames(fileNames) {
+            me.clearDragAndDrop();
+            fileNames.forEach(fileName => {
+                const name = document.createTextNode(fileName);
+                dragAndDropFileNames.appendChild(name);
+                dragAndDropFileNames.appendChild(document.createElement('br'));
+            });
+        }
+
+        /**
+         * hides the attachment
+         *
+         * This will not hide the preview (see {@see AttachmentViewer.hideAttachmentPreview}
+         * for that) nor will it hide the attachment link if it was moved somewhere
+         * else (see {@see AttachmentViewer.moveAttachmentTo}).
+         *
+         * @name AttachmentViewer.hideAttachment
+         * @function
+         */
+        me.hideAttachment = function () {
+            attachment.classList.add('hidden');
+        };
+
+        /**
+         * hides the attachment preview
+         *
+         * @name AttachmentViewer.hideAttachmentPreview
+         * @function
+         */
+        me.hideAttachmentPreview = function () {
+            if (attachmentPreview) {
+                attachmentPreview.classList.add('hidden');
+            }
+        };
+
+        /**
+         * checks if has any attachment preview that is currently rendered
+         *
+         * Note: This does not verify if the attachment preview is actually shown to the user, as it might be hidden ({@see AttachmentViewer.hideAttachmentPreview}).
+         *
+         * @name AttachmentViewer.hasAttachmentPreview
+         * @function
+         * @return {boolean}
+         */
+        me.hasAttachmentPreview = function () {
+            return attachmentPreview.children.length > 0;
+        };
+
+        /**
+         * checks if there is an attachment displayed
+         *
+         * @name   AttachmentViewer.hasAttachment
+         * @function
+         */
+        me.hasAttachment = function () {
+            if (!attachment) {
+                return false;
+            }
+
+            // Check if there are actual attachment data items (not just UI elements)
+            if (attachmentsData.length > 0) {
+                return true;
+            }
+            // Also check UI elements in case data was removed but UI wasn't updated
+            return attachment.children.length > 0;
+        };
+
+        /**
+         * checks if there is attachment data (for preview!) available
+         *
+         * It returns true, when there is data that needs to be encrypted.
+         *
+         * @name   AttachmentViewer.hasAttachmentData
+         * @function
+         */
+        me.hasAttachmentData = function()
+        {
+            // Check if there are actual attachment data items (not just UI elements)
+            return attachmentsData.length > 0;
+        };
+
+        /**
+         * return the attachments
+         *
+         * @name   AttachmentViewer.getAttachments
+         * @function
+         * @returns {array}
+         */
+        me.getAttachments = function () {
+            return [...attachment.querySelectorAll('a')].map(link => (
+                [
+                    link.href,
+                    link.download
+                ]
+            ));
+        };
+
+        /**
+         * Get attachment mime type
+         *
+         * @name AttachmentViewer.getAttachmentMimeType
+         * @function
+         * @param {string} attachmentData - Base64 string
+         */
+        me.getAttachmentMimeType = function (attachmentData) {
+            // position in data URI string of where mimeType ends
+            const mimeTypeEnd = attachmentData.indexOf(';');
+            if (mimeTypeEnd < 6) {
+                return '';
+            }
+
+            // extract mimeType
+            return attachmentData.substring(5, mimeTypeEnd).toLowerCase();
+        };
+
+        /**
+         * moves the attachment link to another element
+         *
+         * It is advisable to hide the attachment afterwards (AttachmentViewer.hideAttachment)
+         *
+         * @name   AttachmentViewer.moveAttachmentTo
+         * @function
+         * @param {HTMLElement} element - the wrapper/container element where this should be moved to
+         * @param {array} attachment - attachment data
+         * @param {string} label - the text to show (%s will be replaced with the file name), will automatically be translated
+         */
+        me.moveAttachmentTo = function (element, attachment, label) {
+            const attachmentLink = document.createElement('a');
+            attachmentLink.className = 'alert-link';
+            attachmentLink.href = attachment[0];
+            attachmentLink.download = attachment[1];
+
+            // move element to new place
+            element.appendChild(attachmentLink);
+
+            // update text - ensuring no HTML is inserted into the text node
+            I18n._(attachmentLink, label, attachment[1]);
+        };
+
+        /**
+         * read files data as data URL using the FileReader API
+         *
+         * @name   AttachmentViewer.readFileData
+         * @private
+         * @function
+         * @param {FileList[]} loadedFiles (optional) loaded files array
+         * @see {@link https://developer.mozilla.org/en-US/docs/Web/API/FileReader#readAsDataURL()}
+         */
+        function readFileData(loadedFiles = []) {
+            // Clear old cache
+            me.removeAttachmentData();
+
+            if (typeof FileReader === 'undefined') {
+                // revert loading status…
+                me.hideAttachment();
+                me.hideAttachmentPreview();
+                Alert.showWarning('Your browser does not support uploading encrypted files. Please use a newer browser.');
+                return;
+            }
+
+            if (loadedFiles && loadedFiles.length > 0) {
+                const fileNames = loadedFiles.map((loadedFile => loadedFile.name));
+                printDragAndDropFileNames(fileNames);
+            } else {
+                const fileInput = document.getElementById('file');
+                if (fileInput && fileInput.files) {
+                    loadedFiles = [...fileInput.files];
+                }
+                me.clearDragAndDrop();
+            }
+
+            if (loadedFiles.length > 0) {
+                files = loadedFiles;
+                loadedFiles.forEach((loadedFile, index) => {
+                    const fileReader = new FileReader();
+
+                    fileReader.onload = function (event) {
+                        const dataURL = event.target.result;
+                        if (dataURL) {
+                            attachmentsData[index] = dataURL;
+                        }
+
+                        if (Editor.isPreview()) {
+                            me.handleAttachmentPreview(attachmentPreview, dataURL);
+                            attachmentPreview.classList.remove('hidden');
+                        }
+
+                        TopNav.highlightFileupload();
+                    };
+
+                    fileReader.readAsDataURL(loadedFile);
+                });
+            } else {
+                me.removeAttachmentData();
+            }
+        }
+
+        /**
+         * handle the preview of files decoded to blob that can either be an image, video, audio or pdf element
+         *
+         * @name   AttachmentViewer.handleBlobAttachmentPreview
+         * @function
+         * @argument {HTMLElement?} targetElement element where the preview should be appended
+         * @argument {string} blobUrl as a blob URL
+         * @argument {string} mimeType type
+         */
+        me.handleBlobAttachmentPreview = function (targetElement, blobUrl, mimeType) {
+            if (!targetElement) {
+                console.log('Attachment preview element not found/disabled, cannot show attachment preview.');
+                return;
+            }
+
+            const alreadyIncludesCurrentAttachment = targetElement.querySelectorAll(`[src='${blobUrl}']`).length > 0;
+
+            if (blobUrl && !alreadyIncludesCurrentAttachment) {
+                if (mimeType.startsWith('image/')) {
+                    const image = document.createElement('img');
+                    image.setAttribute('src', blobUrl);
+                    image.setAttribute('class', 'img-thumbnail');
+                    targetElement.appendChild(image);
+                } else if (mimeType.startsWith('video/')) {
+                    const video = document.createElement('video');
+                    video.setAttribute('controls', 'true');
+                    video.setAttribute('autoplay', 'true');
+                    video.setAttribute('class', 'img-thumbnail');
+                    const source = document.createElement('source');
+                    source.setAttribute('type', mimeType);
+                    source.setAttribute('src', blobUrl);
+                    video.appendChild(source);
+                    targetElement.appendChild(video);
+                } else if (mimeType.startsWith('audio/')) {
+                    const audio = document.createElement('audio');
+                    audio.setAttribute('controls', 'true');
+                    audio.setAttribute('autoplay', 'true');
+                    const source = document.createElement('source');
+                    source.setAttribute('type', mimeType);
+                    source.setAttribute('src', blobUrl);
+                    audio.appendChild(source);
+                    targetElement.appendChild(audio);
+                } else if (mimeType === 'application/pdf') {
+                    const embed = document.createElement('embed');
+                    embed.setAttribute('src', blobUrl);
+                    embed.setAttribute('type', 'application/pdf');
+                    embed.setAttribute('class', 'pdfPreview');
+                    // Fallback for browsers, that don't support the vh unit
+                    embed.style.height = window.innerHeight + 'px';
+                    targetElement.appendChild(embed);
+                }
+            }
+        };
+
+        /**
+         * attaches the file attachment drag & drop handler to the page
+         *
+         * @name   AttachmentViewer.addDragDropHandler
+         * @private
+         * @function
+         */
+        function addDragDropHandler() {
+            if (typeof fileInput === 'undefined' || fileInput === null) {
+                return;
+            }
+
+            const handleDragEnterOrOver = function (event) {
+                event.stopPropagation();
+                event.preventDefault();
+                return false;
+            };
+
+            const handleDrop = function (event) {
+                event.stopPropagation();
+                event.preventDefault();
+
+                if (TopNav.isAttachmentReadonly()) {
+                    return false;
+                }
+
+                if (fileInput) {
+                    const files = [...event.dataTransfer.files];
+                    //Clear the file input:
+                    fileInput.value = '';
+                    //Only works in Chrome:
+                    //fileInput.files = event.dataTransfer.files;
+
+                    readFileData(files);
+                }
+            };
+
+            draghover(document);
+            document.addEventListener('draghoverstart', function (e) {
+                if (TopNav.isAttachmentReadonly()) {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    return false;
+                }
+                // show dropzone to indicate drop support
+                dropzone.classList.remove('hidden');
+            });
+            document.addEventListener('draghoverend', function () {
+                dropzone.classList.add('hidden');
+            });
+
+            document.addEventListener('drop', handleDrop);
+            document.addEventListener('dragenter', handleDragEnterOrOver);
+            document.addEventListener('dragover', handleDragEnterOrOver);
+
+            fileInput.addEventListener('change', function () {
+                readFileData();
+            });
+        }
+
+        /**
+         * attaches the clipboard attachment handler to the page
+         *
+         * @name   AttachmentViewer.addClipboardEventHandler
+         * @private
+         * @function
+         */
+        function addClipboardEventHandler() {
+            document.addEventListener('paste', (event) => {
+                const items = (event.clipboardData || event.originalEvent.clipboardData).items;
+                const files = [...items]
+                    .filter(item => item.kind === 'file')
+                    .map(item => item.getAsFile());
+
+                if (TopNav.isAttachmentReadonly() && files.length) {
+                    event.stopPropagation();
+                    event.preventDefault();
+                    return false;
+                }
+
+                if (files.length) {
+                    readFileData(files);
+                }
+            });
+        }
+
+
+        /**
+         * getter for attachment data
+         *
+         * @name   AttachmentViewer.getAttachmentsData
+         * @function
+         * @return {string[]}
+         */
+        me.getAttachmentsData = function () {
+            return attachmentsData;
+        };
+
+        /**
+         * getter for attachment preview
+         *
+         * @name   AttachmentViewer.getAttachmentPreview
+         * @function
+         * @return {HTMLElement}
+         */
+        me.getAttachmentPreview = function () {
+            return attachmentPreview;
+        };
+
+        /**
+         * getter for files data, returns the file list
+         *
+         * @name   AttachmentViewer.getFiles
+         * @function
+         * @return {FileList[]}
+         */
+        me.getFiles = function () {
+            return files;
+        };
+
+        /**
+         * initiate
+         *
+         * preloads HTMLElements
+         *
+         * @name   AttachmentViewer.init
+         * @function
+         */
+        me.init = function () {
+            attachment = document.getElementById('attachment');
+            dragAndDropFileNames = document.getElementById('dragAndDropFileName');
+            dropzone = document.getElementById('dropzone');
+            if (attachment) {
+                attachmentPreview = document.getElementById('attachmentPreview');
+
+                fileInput = document.getElementById('file');
+                addDragDropHandler();
+                addClipboardEventHandler();
+            }
+        };
+
+        return me;
+    })();
+
+    /**
+     * (view) Shows discussion thread and handles replies
+     *
+     * @name   DiscussionViewer
+     * @class
+     */
+    const DiscussionViewer = (function () {
+        const me = {};
+
+        let commentTail,
+            discussion,
+            reply,
+            replyMessage,
+            replyNickname,
+            replyStatus,
+            commentContainer,
+            replyCommentId;
+
+        /**
+         * initializes the templates
+         *
+         * @name   DiscussionViewer.initTemplates
+         * @private
+         * @function
+         */
+        function initTemplates() {
+            reply = Model.getTemplate('reply');
+            replyMessage = reply.querySelector('#replymessage');
+            replyNickname = reply.querySelector('#nickname');
+            replyStatus = reply.querySelector('#replystatus');
+
+            // cache elements
+            commentTail = Model.getTemplate('commenttail');
+
+            const replyButton = reply.querySelector('#replybutton');
+            if (replyButton) {
+                replyButton.addEventListener('click', PasteEncrypter.sendComment);
+            }
+
+            addEventListeners();
+        }
+
+        /**
+         * open the comment entry when clicking the "Reply" button of a comment
+         *
+         * @name   DiscussionViewer.openReply
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function openReply(event) {
+            const source = event.currentTarget || event.target;
+
+            // show all reply buttons
+            commentContainer.querySelectorAll('button').forEach(btn => btn.classList.remove('hidden'));
+
+            // hide the current reply button
+            source.classList.add('hidden');
+
+            // clear input
+            replyMessage.value = '';
+            replyNickname.value = '';
+
+            // get comment id from source element
+            replyCommentId = source.parentElement.id.split('_')[1];
+
+            // move to correct position
+            const parent = source.parentNode;
+            if (parent && !reply.contains(source)) {
+                if (typeof source.after === 'function') {
+                    source.after(reply);
+                } else if (source.nextSibling) {
+                    parent.insertBefore(reply, source.nextSibling);
+                } else {
+                    parent.appendChild(reply);
+                }
+            }
+
+            // show
+            reply.classList.remove('hidden');
+            replyMessage.focus();
+
+            event.preventDefault();
+        }
+
+        /**
+         * custom handler for displaying notifications in own status message area
+         *
+         * @name   DiscussionViewer.handleNotification
+         * @function
+         * @param  {string} alertType
+         * @return {Boolean|HTMLElement}
+         */
+        me.handleNotification = function (alertType) {
+            // ignore loading messages
+            if (alertType === 'loading') {
+                return false;
+            }
+
+            if (alertType === 'danger') {
+                replyStatus.classList.remove('alert-info');
+                replyStatus.classList.add('alert-danger');
+                const replyIcon = replyStatus.querySelector(':first-child');
+                if (replyIcon) {
+                    replyIcon.classList.remove('glyphicon-alert');
+                    replyIcon.classList.add('glyphicon-info-sign');
+                }
+            } else {
+                replyStatus.classList.remove('alert-danger');
+                replyStatus.classList.add('alert-info');
+                const replyIcon = replyStatus.querySelector(':first-child');
+                if (replyIcon) {
+                    replyIcon.classList.remove('glyphicon-info-sign');
+                    replyIcon.classList.add('glyphicon-alert');
+                }
+            }
+
+            return replyStatus;
+        };
+
+        /**
+         * adds another comment
+         *
+         * @name   DiscussionViewer.addComment
+         * @function
+         * @param {Comment} comment
+         * @param {string} commentText
+         * @param {string} nickname
+         */
+        me.addComment = function (comment, commentText, nickname) {
+            if (commentText === '') {
+                commentText = 'comment decryption failed';
+            }
+
+            // create new comment based on template
+            const commentEntry = Model.getTemplate('comment');
+            if (!commentEntry) {
+                return;
+            }
+            commentEntry.id = 'comment_' + comment.id;
+            const commentEntryData = commentEntry.querySelector('div.commentdata');
+            if (!commentEntryData) {
+                return;
+            }
+
+            // set & parse text
+            commentEntryData.textContent = commentText;
+            Helper.urls2links(commentEntryData);
+
+            // set nickname
+            if (nickname.length > 0) {
+                const nicknameElement = commentEntry.querySelector('span.nickname');
+                if (nicknameElement) {
+                    nicknameElement.textContent = nickname;
+                }
+            } else {
+                const anonCommenter = document.createElement('em');
+                anonCommenter.textContent = I18n._('Anonymous');
+                const nicknameElement = commentEntry.querySelector('span.nickname');
+                if (nicknameElement) {
+                    nicknameElement.innerHTML = '';
+                    nicknameElement.appendChild(anonCommenter);
+                }
+            }
+
+            // set date
+            const created = comment.getCreated();
+            const commentDate = created === 0 ? '' : ' (' + (new Date(created * 1000).toLocaleString()) + ')';
+            const dateSpan = commentEntry.querySelector('span.commentdate');
+            if (dateSpan) {
+                dateSpan.textContent = commentDate;
+                dateSpan.setAttribute('title', 'CommentID: ' + comment.id);
+            }
+
+            // if an avatar is available, display it
+            const icon = comment.getIcon();
+            if (icon) {
+                const iconTitle = 'Avatar generated from IP address';
+                const image = document.createElement('img');
+                // Set the title immediately with the current translation. If
+                // the language has not been loaded yet, this will fall back to
+                // English, so we also register a callback to re-apply the
+                // translation once available. To avoid a race condition, we
+                // register the callback first, then translate - if the language
+                // loads between the two lines, both will set the translated text.
+                I18n.onLanguageLoaded(function () {
+                    image.setAttribute('title', I18n._(iconTitle));
+                });
+                image.setAttribute('title', I18n._(iconTitle));
+                image.setAttribute('src', icon);
+                image.setAttribute('class', 'vizhash');
+                const nickSpan = commentEntry.querySelector('span.nickname');
+                if (nickSpan) {
+                    nickSpan.prepend(' ');
+                    nickSpan.prepend(image);
+                }
+            }
+
+            // starting point (default value/fallback)
+            let place = commentContainer;
+
+            // if parent comment exists
+            const parentComment = document.getElementById('comment_' + comment.parentid);
+            if (parentComment) {
+                // use parent as position for new comment, so it is shifted
+                // to the right
+                place = parentComment;
+            }
+
+            // attach button handler before inserting
+            const replyButton = commentEntry.querySelector('button');
+            if (replyButton) {
+                replyButton.addEventListener('click', openReply);
+            }
+
+            // finally append comment
+            place.appendChild(commentEntry);
+        };
+
+        /**
+         * finishes the discussion area after last comment
+         *
+         * @name   DiscussionViewer.finishDiscussion
+         * @function
+         */
+        me.finishDiscussion = function () {
+            // add 'add new comment' area
+            const tail = commentTail.cloneNode(true);
+            const tailButton = tail.querySelector('button');
+            if (tailButton) {
+                tailButton.addEventListener('click', openReply);
+            }
+            commentContainer.appendChild(tail);
+
+            // show discussions
+            discussion.classList.remove('hidden');
+        };
+
+        /**
+         * removes the old discussion and prepares everything for creating a new
+         * one.
+         *
+         * @name   DiscussionViewer.prepareNewDiscussion
+         * @function
+         */
+        me.prepareNewDiscussion = function () {
+            commentContainer.innerHTML = '';
+            discussion.classList.add('hidden');
+
+            // (re-)init templates
+            initTemplates();
+        };
+
+        /**
+         * returns the users message from the reply form
+         *
+         * @name   DiscussionViewer.getReplyMessage
+         * @function
+         * @return {String}
+         */
+        me.getReplyMessage = function () {
+            return replyMessage.value;
+        };
+
+        /**
+         * returns the users nickname (if any) from the reply form
+         *
+         * @name   DiscussionViewer.getReplyNickname
+         * @function
+         * @return {String}
+         */
+        me.getReplyNickname = function () {
+            return replyNickname.value;
+        };
+
+        /**
+         * returns the id of the parent comment the user is replying to
+         *
+         * @name   DiscussionViewer.getReplyCommentId
+         * @function
+         * @return {number|undefined}
+         */
+        me.getReplyCommentId = function () {
+            return replyCommentId;
+        };
+
+        /**
+         * highlights a specific comment and scrolls to it if necessary
+         *
+         * @name   DiscussionViewer.highlightComment
+         * @function
+         * @param {string} commentId
+         * @param {Boolean} fadeOut - whether to fade out the comment
+         */
+        me.highlightComment = function (commentId, fadeOut) {
+            const comment = document.getElementById('comment_' + commentId);
+            // in case comment does not exist, cancel
+            if (!comment) {
+                return;
+            }
+
+            comment.classList.add('highlight');
+            if (fadeOut === true) {
+                setTimeout(function () {
+                    comment.classList.remove('highlight');
+                }, 300);
+            }
+
+            if (('checkVisibility' in comment ? comment.checkVisibility() : comment.offsetParent !== null) === false) {
+                if (typeof comment.scrollIntoView === 'function') {
+                    comment.scrollIntoView({ block: 'center' });
+                }
+            }
+        };
+
+        /**
+         * Binds events to templates (**and** all )
+         */
+        function addEventListeners() {
+            //
+            document.querySelectorAll('#commenttail button')
+                .forEach(btn => btn.addEventListener('click', openReply));
+
+            document.querySelectorAll('#comment button')
+                .forEach(btn => btn.addEventListener('click', openReply));
+        }
+
+        /**
+         * initiate
+         *
+         * preloads HTML elements
+         *
+         * @name   DiscussionViewer.init
+         * @function
+         */
+        me.init = function () {
+           // todo: remove
+            addEventListeners();
+
+            commentContainer = document.getElementById('commentcontainer');
+            discussion = document.getElementById('discussion');
+        };
+
+        return me;
+    })();
+
+    /**
+     * Manage top (navigation) bar
+     *
+     * @name   TopNav
+     * @param  {object} window
+     * @param  {object} document
+     * @class
+     */
+    const TopNav = (function (window, document) {
+        const me = {};
+
+        let createButtonsDisplayed = false,
+            viewButtonsDisplayed = false,
+            burnAfterReadingDefault = false,
+            openDiscussionDefault = false,
+            attach,
+            burnAfterReading,
+            burnAfterReadingOption,
+            cloneButton,
+            customAttachment,
+            expiration,
+            fileRemoveButton,
+            fileWrap,
+            formatter,
+            newButton,
+            openDiscussion,
+            openDiscussionOption,
+            password,
+            passwordInput,
+            rawTextButton,
+            downloadTextButton,
+            qrCodeLink,
+            emailLink,
+            sendButton,
+            retryButton,
+            pasteExpiration = null,
+            retryButtonCallback;
+
+        /**
+         * set the expiration on bootstrap templates in dropdown
+         *
+         * @name   TopNav.updateExpiration
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function updateExpiration(event) {
+            // get selected option
+            const target = event.target;
+
+            // update dropdown display and save new expiration time
+            const display = document.getElementById('pasteExpirationDisplay');
+            if (display) {
+                display.textContent = target.textContent;
+            }
+            pasteExpiration = target.getAttribute('data-expiration');
+
+            event.preventDefault();
+        }
+
+        /**
+         * set the format on bootstrap templates in dropdown from user interaction
+         *
+         * @name   TopNav.updateFormat
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function updateFormat(event) {
+            // get selected option
+            const target = event.target;
+
+            // update dropdown display and save new format
+            const newFormat = target.getAttribute('data-format');
+            const display = document.getElementById('pasteFormatterDisplay');
+            if (display) {
+                display.textContent = target.textContent;
+            }
+            PasteViewer.setFormat(newFormat);
+
+            event.preventDefault();
+        }
+
+        /**
+         * when "burn after reading" is checked, disable discussion
+         *
+         * @name   TopNav.changeBurnAfterReading
+         * @private
+         * @function
+         */
+        function changeBurnAfterReading() {
+            if (me.getBurnAfterReading()) {
+                if (openDiscussionOption) {
+                    openDiscussionOption.classList.add('buttondisabled');
+                }
+                if (openDiscussion) {
+                    openDiscussion.checked = false;
+                }
+
+                // if button is actually disabled, force-enable it and uncheck other button
+                if (burnAfterReadingOption) {
+                    burnAfterReadingOption.classList.remove('buttondisabled');
+                }
+            } else {
+                if (openDiscussionOption) {
+                    openDiscussionOption.classList.remove('buttondisabled');
+                }
+            }
+        }
+
+        /**
+         * when discussion is checked, disable "burn after reading"
+         *
+         * @name   TopNav.changeOpenDiscussion
+         * @private
+         * @function
+         */
+        function changeOpenDiscussion() {
+            if (me.getOpenDiscussion()) {
+                if (burnAfterReadingOption) {
+                    burnAfterReadingOption.classList.add('buttondisabled');
+                }
+                if (burnAfterReading) {
+                    burnAfterReading.checked = false;
+                }
+
+                // if button is actually disabled, force-enable it and uncheck other button
+                if (openDiscussionOption) {
+                    openDiscussionOption.classList.remove('buttondisabled');
+                }
+            } else {
+                if (burnAfterReadingOption) {
+                    burnAfterReadingOption.classList.remove('buttondisabled');
+                }
+            }
+        }
+
+        /**
+         * Clear the password input in the top navigation
+         *
+         * @name TopNav.clearPasswordInput
+         * @function
+         */
+
+        function clearPasswordInput() {
+            if (passwordInput) {
+                passwordInput.value = '';
+            }
+        }
+
+
+        /**
+         * Clear the attachment input in the top navigation.
+         *
+         * @name   TopNav.clearAttachmentInput
+         * @function
+         */
+        function clearAttachmentInput() {
+            // hide UI for selected files
+            const inputElement = fileWrap && fileWrap.querySelector('input');
+            if (inputElement) {
+                inputElement.value = '';
+            }
+        }
+
+        /**
+         * return raw text
+         *
+         * @name   TopNav.rawText
+         * @private
+         * @function
+         */
+        function rawText() {
+            TopNav.hideAllButtons();
+            Alert.showLoading('Showing raw text…', 'time');
+            let paste = PasteViewer.getText();
+
+            // push a new state to allow back navigation with browser back button
+            history.pushState(
+                { type: 'raw' },
+                document.title,
+                // recreate document URL
+                Helper.baseUri() + '?' + Model.getPasteId() + '#' +
+                CryptTool.base58encode(Model.getPasteKey())
+            );
+
+            // we use text/html instead of text/plain to avoid a bug when
+            // reloading the raw text view (it reverts to type text/html)
+            const headElements = document.head.querySelectorAll(':not(noscript):not(script):not(link[type="text/css"])');
+
+            const newDoc = document.open('text/html', 'replace');
+            newDoc.write('<!DOCTYPE html><html><head>');
+            for (let i = 0; i < headElements.length; ++i) {
+                newDoc.write(headElements[i].outerHTML);
+            }
+            newDoc.write(
+                '</head><body><pre>' +
+                DOMPurify.sanitize(
+                    Helper.htmlEntities(paste),
+                    purifyHtmlConfig
+                ) +
+                '</pre></body></html>'
+            );
+            newDoc.close();
+        }
+
+        /**
+         * download text
+         *
+         * @name   TopNav.downloadText
+         * @private
+         * @function
+         */
+        function downloadText() {
+            const fileFormat = PasteViewer.getFormat() === 'markdown' ? '.md' : '.txt';
+            const filename = 'document-' + Model.getPasteId() + fileFormat;
+            const text = PasteViewer.getText();
+
+            const element = document.createElement('a');
+            element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
+            element.setAttribute('download', filename);
+
+            element.style.display = 'none';
+            document.body.appendChild(element);
+
+            element.click();
+
+            document.body.removeChild(element);
+        }
+
+        /**
+         * saves the language in a cookie and reloads the page
+         *
+         * @name   TopNav.setLanguage
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function setLanguage(event) {
+            let lang = event.target.getAttribute('data-lang') || event.target.value;
+
+            document.cookie = 'lang=' + lang + '; SameSite=Lax; Secure';
+            window.location.reload();
+            event.preventDefault();
+        }
+
+        /**
+         * save the template in a cookie and reloads the page
+         *
+         * @name TopNav.setTemplate
+         * @private
+         * @function
+         * @param {Event} event
+         */
+        function setTemplate(event) {
+            let template = event.target.getAttribute('data-template') || event.target.value;
+
+            document.cookie = 'template=' + template + '; SameSite=Lax; Secure';
+            window.location.reload();
+            event.preventDefault();
+        }
+
+        /**
+         * hides all messages and creates a new document
+         *
+         * @name   TopNav.clickNewPaste
+         * @private
+         * @function
+         */
+        function clickNewPaste() {
+            Controller.hideStatusMessages();
+            Controller.newPaste();
+        }
+
+        /**
+         * sends the document on [Ctrl]+[S] or, on macOS, [Cmd]+[S]
+         *
+         * Only acts while the send button is shown, so the browser's own
+         * "save page" still works when viewing an existing document.
+         *
+         * @name   TopNav.sendOnShortcut
+         * @private
+         * @function
+         * @param  {KeyboardEvent} event
+         */
+        function sendOnShortcut(event) {
+            // the physical S key, so non-Latin keyboard layouts work, too
+            const isSaveKey = event.code === 'KeyS';
+            // Alt is excluded because AltGr is reported as Ctrl+Alt and some
+            // layouts type letters with AltGr+S, Shift to leave "Save page as"
+            // ([Ctrl]+[Shift]+[S]) to the browser
+            const hasCorrectModifiers = (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey;
+            const isButtonAvailable = sendButton && !sendButton.classList.contains('hidden') && !sendButton.disabled;
+            if (isSaveKey && hasCorrectModifiers && isButtonAvailable) {
+                event.preventDefault();
+                sendButton.click();
+            }
+        }
+
+        /**
+         * retrys some callback registered before
+         *
+         * @name   TopNav.clickRetryButton
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function clickRetryButton(event) {
+            retryButtonCallback(event);
+        }
+
+        /**
+         * removes the existing attachment
+         *
+         * @name   TopNav.removeAttachment
+         * @private
+         * @function
+         * @param  {Event} event
+         */
+        function removeAttachment(event) {
+            // if custom attachment is used, remove it first
+            if (customAttachment && !customAttachment.classList.contains('hidden')) {
+                AttachmentViewer.removeAttachment();
+                customAttachment.classList.add('hidden');
+                fileWrap.classList.remove('hidden');
+            }
+
+            // in any case, remove saved attachment data
+            AttachmentViewer.removeAttachmentData();
+
+            clearAttachmentInput();
+            AttachmentViewer.clearDragAndDrop();
+
+            // pevent '#' from appearing in the URL
+            event.preventDefault();
+        }
+
+        /**
+         * Shows the QR code of the current document (URL).
+         *
+         * @name   TopNav.displayQrCode
+         * @private
+         * @function
+         */
+        function displayQrCode() {
+            const qrCanvas = kjua({
+                render: 'canvas',
+                text: window.location.href
+            });
+            const qrDisplay = document.getElementById('qrcode-display');
+            if (qrDisplay) {
+                qrDisplay.innerHTML = '';
+                qrDisplay.appendChild(qrCanvas);
+            }
+        }
+
+        /**
+         * Template Email body.
+         *
+         * @name   TopNav.templateEmailBody
+         * @private
+         * @param {string} expirationDateString
+         * @param {bool} isBurnafterreading
+         */
+        function templateEmailBody(expirationDateString, isBurnafterreading) {
+            const EOL = '\n';
+            const BULLET = '  - ';
+            let emailBody = '';
+            if (expirationDateString !== null || isBurnafterreading) {
+                emailBody += I18n._('Notice:');
+                emailBody += EOL;
+
+                if (expirationDateString !== null) {
+                    emailBody += EOL;
+                    emailBody += BULLET;
+                    // avoid DOMPurify mess with forward slash in expirationDateString
+                    emailBody += Helper.sprintf(
+                        I18n._(
+                            'This link will expire after %s.',
+                            '%s'
+                        ),
+                        expirationDateString
+                    );
+                }
+                if (isBurnafterreading) {
+                    emailBody += EOL;
+                    emailBody += BULLET;
+                    emailBody += I18n._(
+                        'This link can only be accessed once, do not use back or refresh button in your browser.'
+                    );
+                }
+
+                emailBody += EOL;
+                emailBody += EOL;
+            }
+            emailBody += I18n._('Link:');
+            emailBody += EOL;
+            const pasteUrlElement = document.getElementById('pasteurl');
+            emailBody += (pasteUrlElement && pasteUrlElement.getAttribute('href')) || window.location.href; // href is tried first as it might have been shortened
+            return emailBody;
+        }
+
+        /**
+         * Trigger Email send.
+         *
+         * @name   TopNav.triggerEmailSend
+         * @private
+         * @param {string} subject
+         * @param {string} emailBody
+         */
+        function triggerEmailSend(subject, emailBody) {
+            window.open(
+                `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(emailBody)}`,
+                '_self',
+                'noopener, noreferrer'
+            );
+        }
+
+        /**
+         * Send Email with current document (URL).
+         *
+         * @name   TopNav.sendEmail
+         * @private
+         * @function
+         * @param  {Date|null} expirationDate date of expiration
+         * @param  {bool} isBurnafterreading whether it is burn after reading
+         */
+        function sendEmail(expirationDate, isBurnafterreading) {
+            const expirationDateRoundedToSecond = new Date(expirationDate);
+
+            // round down at least 30 seconds to make up for the delay of request
+            expirationDateRoundedToSecond.setUTCSeconds(
+                expirationDateRoundedToSecond.getUTCSeconds() - 30
+            );
+            expirationDateRoundedToSecond.setUTCSeconds(0);
+
+            // reused as-is by both the confirmation-modal and direct-send paths below
+            const emailSubject = I18n._('Encrypted note on %s', document.title);
+
+            const emailconfirmmodal = document.getElementById('emailconfirmmodal');
+            if (expirationDate !== null) {
+                const emailconfirmTimezoneCurrent = emailconfirmmodal.querySelector('#emailconfirm-timezone-current');
+                const emailconfirmTimezoneUtc = emailconfirmmodal.querySelector('#emailconfirm-timezone-utc');
+                let localeConfiguration = { dateStyle: 'long', timeStyle: 'long' };
+                const bootstrap5EmailConfirmModal = typeof bootstrap !== 'undefined' && bootstrap.Tooltip && bootstrap.Tooltip.VERSION ?
+                    new bootstrap.Modal(emailconfirmmodal) : null;
+
+                function sendEmailAndHideModal() {
+                    const emailBody = templateEmailBody(
+                        // we don't use Date.prototype.toUTCString() because we would like to avoid GMT
+                        expirationDateRoundedToSecond.toLocaleString(
+                            [], localeConfiguration
+                        ), isBurnafterreading
+                    );
+                    if (bootstrap5EmailConfirmModal) {
+                        bootstrap5EmailConfirmModal.hide();
+                    }
+                    triggerEmailSend(emailSubject, emailBody);
+                }
+
+                emailconfirmmodal.addEventListener('shown.bs.modal', () => {
+                    emailconfirmTimezoneUtc.focus();
+                });
+
+                emailconfirmTimezoneCurrent.removeEventListener('click', sendEmailAndHideModal);
+                emailconfirmTimezoneCurrent.addEventListener('click', sendEmailAndHideModal);
+                emailconfirmTimezoneUtc.removeEventListener('click', sendEmailAndHideModal);
+                emailconfirmTimezoneUtc.addEventListener('click', () => {
+                    localeConfiguration.timeZone = 'UTC';
+                    sendEmailAndHideModal();
+                });
+                if (bootstrap5EmailConfirmModal) {
+                    bootstrap5EmailConfirmModal.show();
+                }
+            } else {
+                triggerEmailSend(emailSubject, templateEmailBody(null, isBurnafterreading));
+            }
+        }
+
+        /**
+         * Shows all navigation elements for viewing an existing document
+         *
+         * @name   TopNav.showViewButtons
+         * @function
+         */
+        me.showViewButtons = function () {
+            if (viewButtonsDisplayed) {
+                return;
+            }
+
+            newButton.classList.remove('hidden');
+            cloneButton.classList.remove('hidden');
+            rawTextButton.classList.remove('hidden');
+            downloadTextButton.classList.remove('hidden');
+            qrCodeLink.classList.remove('hidden');
+
+            viewButtonsDisplayed = true;
+        };
+
+        /**
+         * Hides all navigation elements for viewing an existing document
+         *
+         * @name   TopNav.hideViewButtons
+         * @function
+         */
+        me.hideViewButtons = function () {
+            if (!viewButtonsDisplayed) {
+                return;
+            }
+
+            cloneButton.classList.add('hidden');
+            newButton.classList.add('hidden');
+            rawTextButton.classList.add('hidden');
+            downloadTextButton.classList.add('hidden');
+            qrCodeLink.classList.add('hidden');
+            me.hideEmailButton();
+
+            viewButtonsDisplayed = false;
+        };
+
+        /**
+         * Hides all elements belonging to existing documents
+         *
+         * @name   TopNav.hideAllButtons
+         * @function
+         */
+        me.hideAllButtons = function () {
+            me.hideViewButtons();
+            me.hideCreateButtons();
+        };
+
+        /**
+         * shows all elements needed when creating a new document
+         *
+         * @name   TopNav.showCreateButtons
+         * @function
+         */
+        me.showCreateButtons = function () {
+            if (createButtonsDisplayed) {
+                return;
+            }
+
+            if (attach) {
+                attach.classList.remove('hidden');
+            }
+            burnAfterReadingOption.classList.remove('hidden');
+            expiration.classList.remove('hidden');
+            formatter.classList.remove('hidden');
+            newButton.classList.remove('hidden');
+            openDiscussionOption.classList.remove('hidden');
+            password.classList.remove('hidden');
+            sendButton.classList.remove('hidden');
+
+            createButtonsDisplayed = true;
+        };
+
+        /**
+         * shows all elements needed when creating a new document
+         *
+         * @name   TopNav.hideCreateButtons
+         * @function
+         */
+        me.hideCreateButtons = function () {
+            if (!createButtonsDisplayed) {
+                return;
+            }
+
+            newButton.classList.add('hidden');
+            sendButton.classList.add('hidden');
+            expiration.classList.add('hidden');
+            formatter.classList.add('hidden');
+            burnAfterReadingOption.classList.add('hidden');
+            openDiscussionOption.classList.add('hidden');
+            password.classList.add('hidden');
+            if (attach) {
+                attach.classList.add('hidden');
+            }
+
+            createButtonsDisplayed = false;
+        };
+
+        /**
+         * only shows the "new document" button
+         *
+         * @name   TopNav.showNewPasteButton
+         * @function
+         */
+        me.showNewPasteButton = function () {
+            newButton.classList.remove('hidden');
+        };
+
+        /**
+         * only shows the "retry" button
+         *
+         * @name   TopNav.showRetryButton
+         * @function
+         */
+        me.showRetryButton = function () {
+            retryButton.classList.remove('hidden');
+            // The Bootstrap 5 template gives Retry its own list item. That item
+            // still takes a flex gap while only the button is hidden.
+            if (Helper.isBootstrap5()) {
+                retryButton.parentElement.classList.remove('hidden');
+            }
+        };
+
+        /**
+         * hides the "retry" button
+         *
+         * @name   TopNav.hideRetryButton
+         * @function
+         */
+        me.hideRetryButton = function () {
+            retryButton.classList.add('hidden');
+            if (Helper.isBootstrap5()) {
+                retryButton.parentElement.classList.add('hidden');
+            }
+        };
+
+        /**
+         * show the "email" button
+         *
+         * @name   TopNav.showEmailbutton
+         * @function
+         * @param {number|undefined} optionalRemainingTimeInSeconds
+         * @param {bool|undefined} optionalBurnAfterReading
+         */
+        me.showEmailButton = function (optionalRemainingTimeInSeconds, optionalBurnAfterReading) {
+            try {
+                // we cache expiration date in closure to avoid inaccurate expiration datetime
+                const expirationDate = Helper.calculateExpirationDate(
+                    new Date(),
+                    typeof optionalRemainingTimeInSeconds === 'number' ? optionalRemainingTimeInSeconds : TopNav.getExpiration()
+                );
+                const isBurnafterreading = typeof optionalBurnAfterReading === 'boolean' ?
+                    optionalBurnAfterReading : TopNav.getBurnAfterReading();
+
+                emailLink.classList.remove('hidden');
+                emailLink.removeEventListener('click', sendEmail);
+                emailLink.addEventListener('click', () => {
+                    sendEmail(expirationDate, isBurnafterreading);
+                });
+            } catch (error) {
+                console.error(error);
+                Alert.showError('Cannot calculate expiration date.');
+            }
+        };
+
+        /**
+         * hide the "email" button
+         *
+         * @name   TopNav.hideEmailButton
+         * @function
+         */
+        me.hideEmailButton = function () {
+            if (!emailLink) {
+                return;
+            }
+
+            emailLink.classList.add('hidden');
+            emailLink.removeEventListener('click', sendEmail);
+        };
+
+        /**
+         * only hides the clone button
+         *
+         * @name   TopNav.hideCloneButton
+         * @function
+         */
+        me.hideCloneButton = function () {
+            cloneButton.classList.add('hidden');
+        };
+
+        /**
+         * only hides the raw text button
+         *
+         * @name   TopNav.hideRawButton
+         * @function
+         */
+        me.hideRawButton = function () {
+            rawTextButton.classList.add('hidden');
+        };
+
+        /**
+         * only hides the download text button
+         *
+         * @name   TopNav.hideRawButton
+         * @function
+         */
+        me.hideDownloadButton = function () {
+            downloadTextButton.classList.add('hidden');
+        };
+
+        /**
+         * only hides the qr code button
+         *
+         * @name   TopNav.hideQrCodeButton
+         * @function
+         */
+        me.hideQrCodeButton = function () {
+            qrCodeLink.classList.add('hidden');
+        };
+
+        /**
+         * hide irrelevant buttons when viewing burn after reading document
+         *
+         * @name   TopNav.hideBurnAfterReadingButtons
+         * @function
+         */
+        me.hideBurnAfterReadingButtons = function () {
+            me.hideCloneButton();
+            me.hideQrCodeButton();
+            me.hideEmailButton();
+        };
+
+        /**
+         * hides the file selector in attachment
+         *
+         * @name   TopNav.hideFileSelector
+         * @function
+         */
+        me.hideFileSelector = function () {
+            fileWrap.classList.add('hidden');
+        };
+
+
+        /**
+         * shows the custom attachment
+         *
+         * @name   TopNav.showCustomAttachment
+         * @function
+         */
+        me.showCustomAttachment = function () {
+            if (!customAttachment) {
+                return;
+            }
+
+            customAttachment.classList.remove('hidden');
+        };
+
+        /**
+         * hides the custom attachment
+         *
+         * @name  TopNav.hideCustomAttachment
+         * @function
+         */
+        me.hideCustomAttachment = function () {
+            if (customAttachment) {
+                customAttachment.classList.add('hidden');
+            }
+
+            if (fileWrap) {
+                fileWrap.classList.remove('hidden');
+            }
+        };
+
+        /**
+         * collapses the navigation bar, only if expanded
+         *
+         * @name   TopNav.collapseBar
+         * @function
+         */
+        me.collapseBar = function () {
+            const navbar = document.getElementById('navbar');
+            if (navbar && navbar.getAttribute('aria-expanded') === 'true') {
+                const toggle = document.querySelector('.navbar-toggle');
+                if (toggle) {
+                    toggle.click();
+                }
+            }
+        };
+
+        /**
+         * Reset the top navigation back to it's default values.
+         *
+         * @name   TopNav.resetInput
+         * @function
+         */
+        me.resetInput = function () {
+            clearAttachmentInput();
+            clearPasswordInput();
+            if (burnAfterReading) {
+                burnAfterReading.checked = burnAfterReadingDefault;
+            }
+            if (openDiscussion) {
+                openDiscussion.checked = openDiscussionDefault;
+            }
+            if (openDiscussionDefault || !burnAfterReadingDefault) {
+                openDiscussionOption.classList.remove('buttondisabled');
+            }
+            if (burnAfterReadingDefault || !openDiscussionDefault) {
+                burnAfterReadingOption.classList.remove('buttondisabled');
+            }
+
+            pasteExpiration = Model.getExpirationDefault() || pasteExpiration;
+            const pasteExpirationSelect = document.getElementById('pasteExpiration');
+            if (pasteExpirationSelect) {
+                pasteExpirationSelect.querySelectorAll('option').forEach((option) => {
+                    if (option.value === pasteExpiration) {
+                        const display = document.getElementById('pasteExpirationDisplay');
+                        if (display) {
+                            display.textContent = option.textContent;
+                        }
+                    }
+                });
+            }
+        };
+
+        /**
+         * returns the currently set expiration time
+         *
+         * @name   TopNav.getExpiration
+         * @function
+         * @return {int}
+         */
+        me.getExpiration = function () {
+            return pasteExpiration;
+        };
+
+        /**
+         * returns the currently selected file(s)
+         *
+         * @name   TopNav.getFileList
+         * @function
+         * @return {FileList|null}
+         */
+        me.getFileList = function () {
+            const file = document.getElementById('file');
+
+            // if no file given, return null
+            if (!file || !file.files || !file.files.length) {
+                return null;
+            }
+
+            // ensure the selected file is still accessible
+            if (!file.files[0]) {
+                return null;
+            }
+
+            return file.files;
+        };
+
+        /**
+         * returns the state of the burn after reading checkbox
+         *
+         * @name   TopNav.getBurnAfterReading
+         * @function
+         * @return {bool}
+         */
+        me.getBurnAfterReading = function () {
+            return burnAfterReading ? !!burnAfterReading.checked : false;
+        };
+
+        /**
+         * returns the state of the discussion checkbox
+         *
+         * @name   TopNav.getOpenDiscussion
+         * @function
+         * @return {bool}
+         */
+        me.getOpenDiscussion = function () {
+            return openDiscussion ? !!openDiscussion.checked : false;
+        };
+
+        /**
+         * returns the entered password
+         *
+         * @name   TopNav.getPassword
+         * @function
+         * @return {string}
+         */
+        me.getPassword = function () {
+            // when password is disabled passwordInput.value will return undefined
+            return passwordInput && passwordInput.value || '';
+        };
+
+        /**
+         * returns the element where custom attachments can be placed
+         *
+         * Used by AttachmentViewer when an attachment is cloned here.
+         *
+         * @name   TopNav.getCustomAttachment
+         * @function
+         * @return {HTMLElement}
+         */
+        me.getCustomAttachment = function () {
+            return customAttachment;
+        };
+
+        /**
+         * Set a function to call when the retry button is clicked.
+         *
+         * @name   TopNav.setRetryCallback
+         * @function
+         * @param {function} callback
+         */
+        me.setRetryCallback = function (callback) {
+            retryButtonCallback = callback;
+        };
+
+        /**
+         * Highlight file upload
+         *
+         * @name  TopNav.highlightFileupload
+         * @function
+         */
+        me.highlightFileupload = function () {
+            // visually indicate file uploaded
+            const attachDropdownToggle = attach && attach.querySelector('.dropdown-toggle');
+            if (attachDropdownToggle && attachDropdownToggle.getAttribute('aria-expanded') === 'false') {
+                if (Helper.isBootstrap5()) {
+                    new bootstrap.Dropdown(attachDropdownToggle).toggle();
+                } else {
+                    attachDropdownToggle.click();
+                }
+            }
+            fileWrap.classList.add('highlight');
+            setTimeout(function () {
+                fileWrap.classList.remove('highlight');
+            }, 300);
+        }
+
+        /**
+         * set the format on bootstrap templates in dropdown programmatically
+         *
+         * @name    TopNav.setFormat
+         * @function
+         */
+        me.setFormat = function (format) {
+            if (Helper.isBootstrap5()) {
+                const select = formatter.querySelector('select');
+                if (select) {
+                    select.value = format;
+                }
+            } else {
+                const formatLink = formatter.parentElement.querySelector(`a[data-format="${format}"]`);
+                if (formatLink) {
+                    formatLink.click();
+                }
+            }
+        }
+
+        /**
+         * returns if attachment dropdown is readonly, not editable
+         *
+         * @name   TopNav.isAttachmentReadonly
+         * @function
+         * @return {bool}
+         */
+        me.isAttachmentReadonly = function () {
+            return !createButtonsDisplayed || (attach && attach.classList.contains('hidden'));
+        }
+
+        /**
+         * init navigation manager
+         *
+         * preloads DOM elements
+         *
+         * @name   TopNav.init
+         * @function
+         */
+        /**
+         * bind all navigation event listeners
+         *
+         * @name   TopNav.bindEvents
+         * @private
+         * @function
+         */
+        function bindEvents() {
+            const languageDropdown = document.getElementById('language');
+            if (languageDropdown) {
+                languageDropdown.querySelectorAll('ul.dropdown-menu li a').forEach(link => {
+                    link.addEventListener('click', setLanguage);
+                });
+            }
+
+            const templateDropdown = document.getElementById('template');
+            if (templateDropdown) {
+                templateDropdown.querySelectorAll('ul.dropdown-menu li a').forEach(link => {
+                    link.addEventListener('click', setTemplate);
+                });
+            }
+
+            // bind events
+            if (burnAfterReading) {
+                burnAfterReading.addEventListener('change', changeBurnAfterReading);
+            }
+            if (openDiscussionOption) {
+                openDiscussionOption.addEventListener('change', changeOpenDiscussion);
+            }
+            if (newButton) {
+                newButton.addEventListener('click', clickNewPaste);
+            }
+            if (sendButton) {
+                sendButton.addEventListener('click', PasteEncrypter.sendPaste);
+                document.addEventListener('keydown', sendOnShortcut);
+            }
+            if (cloneButton) {
+                cloneButton.addEventListener('click', Controller.clonePaste);
+            }
+            if (rawTextButton) {
+                rawTextButton.addEventListener('click', rawText);
+            }
+            if (downloadTextButton) {
+                downloadTextButton.addEventListener('click', downloadText);
+            }
+            if (retryButton) {
+                retryButton.addEventListener('click', clickRetryButton);
+            }
+            if (fileRemoveButton) {
+                fileRemoveButton.addEventListener('click', removeAttachment);
+            }
+            if (qrCodeLink) {
+                qrCodeLink.addEventListener('click', displayQrCode);
+            }
+
+            if (Helper.isBootstrap5()) {
+                const pasteExpirationSelect = document.getElementById('pasteExpiration');
+                if (pasteExpirationSelect) {
+                    pasteExpirationSelect.addEventListener('change', function () {
+                        pasteExpiration = Model.getExpirationDefault();
+                    });
+                }
+                const pasteFormatterSelect = document.getElementById('pasteFormatter');
+                if (pasteFormatterSelect) {
+                    pasteFormatterSelect.addEventListener('change', function () {
+                        PasteViewer.setFormat(Model.getFormatDefault());
+                    });
+                }
+            } else {
+                // bootstrap template drop downs
+                if (expiration) {
+                    expiration.parentElement.querySelectorAll('ul.dropdown-menu li a').forEach(link => {
+                        link.addEventListener('click', updateExpiration);
+                    });
+                }
+                if (formatter) {
+                    formatter.parentElement.querySelectorAll('ul.dropdown-menu li a').forEach(link => {
+                        link.addEventListener('click', updateFormat);
+                    });
+                }
+
+                // page drop downs
+                const pasteExpirationSelect = document.getElementById('pasteExpiration');
+                if (pasteExpirationSelect) {
+                    pasteExpirationSelect.addEventListener('change', function () {
+                        pasteExpiration = Model.getExpirationDefault();
+                    });
+                }
+                const pasteFormatterSelect = document.getElementById('pasteFormatter');
+                if (pasteFormatterSelect) {
+                    pasteFormatterSelect.addEventListener('change', function () {
+                        PasteViewer.setFormat(Model.getFormatDefault());
+                    });
+                }
+            }
+        }
+
+        me.init = function () {
+            attach = document.getElementById('attach');
+            burnAfterReading = document.getElementById('burnafterreading');
+            burnAfterReadingOption = document.getElementById('burnafterreadingoption');
+            cloneButton = document.getElementById('clonebutton');
+            customAttachment = document.getElementById('customattachment');
+            expiration = document.getElementById('expiration');
+            fileRemoveButton = document.getElementById('fileremovebutton');
+            fileWrap = document.getElementById('filewrap');
+            formatter = document.getElementById('formatter');
+            newButton = document.getElementById('newbutton');
+            openDiscussion = document.getElementById('opendiscussion');
+            openDiscussionOption = document.getElementById('opendiscussionoption');
+            password = document.getElementById('password');
+            passwordInput = document.getElementById('passwordinput');
+            rawTextButton = document.getElementById('rawtextbutton');
+            downloadTextButton = document.getElementById('downloadtextbutton');
+            retryButton = document.getElementById('retrybutton');
+            sendButton = document.getElementById('sendbutton');
+            qrCodeLink = document.getElementById('qrcodelink');
+            emailLink = document.getElementById('emaillink');
+
+            bindEvents();
+
+            // initiate default state of checkboxes
+            changeBurnAfterReading();
+            changeOpenDiscussion();
+
+            // get default values from template or fall back to set value
+            burnAfterReadingDefault = me.getBurnAfterReading();
+            openDiscussionDefault = me.getOpenDiscussion();
+            pasteExpiration = Model.getExpirationDefault();
+
+            createButtonsDisplayed = false;
+            viewButtonsDisplayed = false;
+        };
+
+        return me;
+    })(window, document);
+
+    /**
+     * Responsible for AJAX requests, transparently handles encryption…
+     *
+     * @name   ServerInteraction
+     * @class
+     */
+    const ServerInteraction = (function () {
+        const me = {};
+
+        let successFunc = null,
+            failureFunc = null,
+            symmetricKey = null,
+            url,
+            data,
+            password;
+
+        /**
+         * public variable ('constant') for errors to prevent magic numbers
+         *
+         * @name   ServerInteraction.error
+         * @readonly
+         * @enum   {Object}
+         */
+        me.error = {
+            okay: 0,
+            custom: 1,
+            unknown: 2,
+            serverError: 3
+        };
+
+        /**
+         * ajaxHeaders to send in AJAX requests
+         *
+         * @name   ServerInteraction.ajaxHeaders
+         * @private
+         * @readonly
+         * @enum   {Object}
+         */
+        const ajaxHeaders = {
+            'X-Requested-With': 'JSONHttpRequest',
+            'Content-Type': 'application/json'
+        };
+
+        /**
+         * called after successful upload
+         *
+         * @name   ServerInteraction.success
+         * @private
+         * @function
+         * @param {int} status
+         * @param {int} result - optional
+         */
+        function success(status, result) {
+            if (successFunc !== null) {
+                // add useful data to result
+                result.encryptionKey = symmetricKey;
+                successFunc(status, result);
+            }
+        }
+
+        /**
+         * called after a upload failure
+         *
+         * @name   ServerInteraction.fail
+         * @private
+         * @function
+         * @param {int} status - internal code
+         * @param {int} result - original error code
+         */
+        function fail(status, result) {
+            if (failureFunc !== null) {
+                failureFunc(status, result);
+            }
+        }
+
+        /**
+         * actually uploads the data
+         *
+         * @name   ServerInteraction.run
+         * @function
+         */
+        me.run = function () {
+            let isPost = Object.keys(data).length > 0,
+                options = {
+                    method: isPost ? 'POST' : 'GET',
+                    headers: ajaxHeaders
+                };
+            if (isPost) {
+                options.body = JSON.stringify(data);
+            }
+            fetch(url, options)
+                .then(response => {
+                    if (!response.ok) {
+                        throw response;
+                    }
+                    return response.json();
+                })
+                .then(result => {
+                    if (result.status === 0) {
+                        success(0, result);
+                    } else if (result.status === 1) {
+                        fail(1, result);
+                    } else {
+                        fail(2, result);
+                    }
+                })
+                .catch(error => {
+                    console.error(error);
+                    fail(3, error);
+                });
+        };
+
+        /**
+         * return currently set data, used in unit testing
+         *
+         * @name   ServerInteraction.getData
+         * @function
+         */
+        me.getData = function () {
+            return data;
+        };
+
+        /**
+         * set success function
+         *
+         * @name   ServerInteraction.setUrl
+         * @function
+         * @param {function} newUrl
+         */
+        me.setUrl = function (newUrl) {
+            url = newUrl;
+        };
+
+        /**
+         * sets the password to use (first value) and optionally also the
+         * encryption key (not recommended, it is automatically generated).
+         *
+         * Note: Call this after prepare() as prepare() resets these values.
+         *
+         * @name   ServerInteraction.setCryptValues
+         * @function
+         * @param {string} newPassword
+         * @param {string} newKey       - optional
+         */
+        me.setCryptParameters = function (newPassword, newKey) {
+            password = newPassword;
+
+            if (typeof newKey !== 'undefined') {
+                symmetricKey = newKey;
+            }
+        };
+
+        /**
+         * set success function
+         *
+         * @name   ServerInteraction.setSuccess
+         * @function
+         * @param {function} func
+         */
+        me.setSuccess = function (func) {
+            successFunc = func;
+        };
+
+        /**
+         * set failure function
+         *
+         * @name   ServerInteraction.setFailure
+         * @function
+         * @param {function} func
+         */
+        me.setFailure = function (func) {
+            failureFunc = func;
+        };
+
+        /**
+         * prepares a new upload
+         *
+         * Call this when doing a new upload to reset any data from potential
+         * previous uploads. Must be called before any other method of this
+         * module.
+         *
+         * @name   ServerInteraction.prepare
+         * @function
+         * @return {object}
+         */
+        me.prepare = function () {
+            // entropy should already be checked!
+
+            // reset password
+            password = '';
+
+            // reset key, so it a new one is generated when it is used
+            symmetricKey = null;
+
+            // reset data
+            successFunc = null;
+            failureFunc = null;
+            url = Helper.baseUri();
+            data = {};
+        };
+
+        /**
+         * encrypts and sets the data
+         *
+         * @name   ServerInteraction.setCipherMessage
+         * @async
+         * @function
+         * @param {object} cipherMessage
+         */
+        me.setCipherMessage = async function (cipherMessage) {
+            if (
+                symmetricKey === null ||
+                (typeof symmetricKey === 'string' && symmetricKey === '')
+            ) {
+                symmetricKey = CryptTool.getSymmetricKey();
+            }
+            if (!data.hasOwnProperty('adata')) {
+                data['adata'] = [];
+            }
+            let cipherResult = await CryptTool.cipher(symmetricKey, password, JSON.stringify(cipherMessage), data['adata']);
+            data['v'] = 2;
+            data['ct'] = cipherResult[0];
+            data['adata'] = cipherResult[1];
+
+        };
+
+        /**
+         * set the additional metadata to send unencrypted
+         *
+         * @name   ServerInteraction.setUnencryptedData
+         * @function
+         * @param {string} index
+         * @param {mixed} element
+         */
+        me.setUnencryptedData = function (index, element) {
+            data[index] = element;
+        };
+
+        /**
+         * Helper, which parses shows a general error message based on the result of the ServerInteraction
+         *
+         * @name    ServerInteraction.parseUploadError
+         * @function
+         * @param {int} status
+         * @param {object} data
+         * @param {string} doThisThing - a human description of the action, which was tried
+         * @return {array}
+         */
+        me.parseUploadError = function (status, data, doThisThing) {
+            let errorArray;
+
+            switch (status) {
+                case me.error.custom:
+                    errorArray = ['Could not ' + doThisThing + ': %s', data.message];
+                    break;
+                case me.error.unknown:
+                    errorArray = ['Could not ' + doThisThing + ': %s', I18n._('unknown status')];
+                    break;
+                case me.error.serverError:
+                    errorArray = ['Could not ' + doThisThing + ': %s', I18n._('server error or not responding')];
+                    break;
+                default:
+                    errorArray = ['Could not ' + doThisThing + ': %s', I18n._('unknown error')];
+                    break;
+            }
+
+            return errorArray;
+        };
+
+        return me;
+    })();
+
+    /**
+     * (controller) Responsible for encrypting document and sending it to server.
+     *
+     * Does upload, encryption is done transparently by ServerInteraction.
+     *
+     * @name PasteEncrypter
+     * @class
+     */
+    const PasteEncrypter = (function () {
+        const me = {};
+
+        /**
+         * called after successful document upload
+         *
+         * @name PasteEncrypter.showCreatedPaste
+         * @private
+         * @function
+         * @param {int} status
+         * @param {object} data
+         */
+        function showCreatedPaste(status, data) {
+            Alert.hideLoading();
+            Alert.hideMessages();
+
+            // show notification
+            const baseUri = Helper.baseUri() + '?',
+                url = baseUri + data.id + (TopNav.getBurnAfterReading() ? loadConfirmPrefix : '#') + CryptTool.base58encode(data.encryptionKey),
+                deleteUrl = baseUri + 'pasteid=' + data.id + '&deletetoken=' + data.deletetoken;
+            PasteStatus.createPasteNotification(url, deleteUrl);
+
+            // show new URL in browser bar
+            history.pushState({ type: 'newpaste' }, document.title, url);
+
+            TopNav.showViewButtons();
+
+            CopyToClipboard.setUrl(url);
+            CopyToClipboard.showKeyboardShortcutHint();
+
+            // this cannot be grouped with showViewButtons due to remaining time calculation
+            TopNav.showEmailButton();
+
+            TopNav.hideRawButton();
+            TopNav.hideDownloadButton();
+            Editor.hide();
+
+            PasteStatus.checkAutoShorten();
+
+            // parse and show text
+            // (preparation already done in me.sendPaste())
+            PasteViewer.run();
+        }
+
+        /**
+         * called after successful comment upload
+         *
+         * @name PasteEncrypter.showUploadedComment
+         * @private
+         * @function
+         * @param {int} status
+         * @param {object} data
+         */
+        function showUploadedComment(status, data) {
+            // show success message
+            Alert.showStatus('Comment posted.');
+
+            // reload document
+            Controller.refreshPaste(function () {
+                // highlight sent comment
+                DiscussionViewer.highlightComment(data.id, true);
+                // reset error handler
+                Alert.setCustomHandler(null);
+            });
+        }
+
+        /**
+         * send a reply in a discussion
+         *
+         * @name   PasteEncrypter.sendComment
+         * @async
+         * @function
+         */
+        me.sendComment = async function () {
+            // get data
+            const plainText = DiscussionViewer.getReplyMessage();
+
+            // do not send if there is no data
+            if (plainText.length === 0) {
+                return;
+            }
+
+            let nickname = DiscussionViewer.getReplyNickname(),
+                parentid = DiscussionViewer.getReplyCommentId();
+
+            Alert.hideMessages();
+            Alert.setCustomHandler(DiscussionViewer.handleNotification);
+
+            // UI loading state
+            TopNav.hideAllButtons();
+            Alert.showLoading('Sending comment…', 'cloud-upload');
+            // prepare server interaction
+            ServerInteraction.prepare();
+            ServerInteraction.setCryptParameters(Prompt.getPassword(), Model.getPasteKey());
+
+            // set success/fail functions
+            ServerInteraction.setSuccess(showUploadedComment);
+            ServerInteraction.setFailure(function (status, data) {
+                // revert loading status…
+                Alert.hideLoading();
+                TopNav.showViewButtons();
+
+                // …show error message…
+                Alert.showError(
+                    ServerInteraction.parseUploadError(status, data, 'post comment')
+                );
+
+                // …and reset error handler
+                Alert.setCustomHandler(null);
+            });
+
+            // fill it with unencrypted params
+            ServerInteraction.setUnencryptedData('pasteid', Model.getPasteId());
+            if (typeof parentid === 'undefined') {
+                // if parent id is not set, this is the top-most comment, so use
+                // document id as parent, as the root element of the discussion tree
+                ServerInteraction.setUnencryptedData('parentid', Model.getPasteId());
+            } else {
+                ServerInteraction.setUnencryptedData('parentid', parentid);
+            }
+
+            // prepare cypher message
+            let cipherMessage = {
+                'comment': plainText
+            };
+            if (nickname.length > 0) {
+                cipherMessage['nickname'] = nickname;
+            }
+
+            await ServerInteraction.setCipherMessage(cipherMessage).catch(Alert.showError);
+            ServerInteraction.run();
+        };
+
+        /**
+         * sends a new document to server
+         *
+         * @name   PasteEncrypter.sendPaste
+         * @async
+         * @function
+         */
+        me.sendPaste = async function () {
+            // hide previous (error) messages
+            Controller.hideStatusMessages();
+
+            // UI loading state
+            TopNav.hideAllButtons();
+            Alert.showLoading('Sending document…', 'cloud-upload');
+            TopNav.collapseBar();
+
+            // get data
+            const plainText = Editor.getText(),
+                  format    = PasteViewer.getFormat(),
+                  // the methods may return different values if no files are attached (null, undefined or false)
+                  files     = TopNav.getFileList() || AttachmentViewer.getFiles() || AttachmentViewer.hasAttachmentData();
+
+            // do not send if there is no data
+            if (plainText.length === 0 && !files) {
+                // revert loading status…
+                Alert.hideLoading();
+                TopNav.showCreateButtons();
+                return;
+            }
+
+            // prepare server interaction
+            ServerInteraction.prepare();
+            ServerInteraction.setCryptParameters(TopNav.getPassword());
+
+            // set success/fail functions
+            ServerInteraction.setSuccess(showCreatedPaste);
+            ServerInteraction.setFailure(function (status, data) {
+                // revert loading status…
+                Alert.hideLoading();
+                TopNav.showCreateButtons();
+
+                // show error message
+                Alert.showError(
+                    ServerInteraction.parseUploadError(status, data, 'create document')
+                );
+            });
+
+            // fill it with unencrypted submitted options
+            ServerInteraction.setUnencryptedData('adata', [
+                null, format,
+                TopNav.getOpenDiscussion() ? 1 : 0,
+                TopNav.getBurnAfterReading() ? 1 : 0
+            ]);
+            ServerInteraction.setUnencryptedData('meta', { 'expire': TopNav.getExpiration() });
+
+            // prepare PasteViewer for later preview
+            PasteViewer.setText(plainText);
+            PasteViewer.setFormat(format);
+
+            // prepare cypher message
+            let attachmentsData = AttachmentViewer.getAttachmentsData(),
+                cipherMessage = {
+                    'paste': plainText
+                };
+            if (attachmentsData.length) {
+                cipherMessage['attachment'] = attachmentsData;
+                cipherMessage['attachment_name'] = AttachmentViewer.getFiles().map(fileInfo => fileInfo.name);
+            } else if (AttachmentViewer.hasAttachment()) {
+                // fall back to cloned part
+                let attachments = AttachmentViewer.getAttachments();
+                cipherMessage['attachment'] = attachments.map(attachment => attachment[0]);
+                cipherMessage['attachment_name'] = attachments.map(attachment => attachment[1]);
+
+                cipherMessage['attachment'] = await Promise.all(cipherMessage['attachment'].map(async (attachment, i) => {
+                    // we need to retrieve data from blob if browser already parsed it in memory
+                    if (typeof attachment === 'string' && attachment.startsWith('blob:')) {
+                        Alert.showStatus(
+                            [
+                                'Retrieving cloned file \'%s\' from memory...',
+                                cipherMessage['attachment_name'][i]
+                            ],
+                            'copy'
+                        );
+                        try {
+                            const response = await fetch(attachment, {
+                                method: 'GET',
+                                credentials: 'omit',
+                                signal: AbortSignal.timeout(10000)
+                            });
+                            if (!response.ok) {
+                                throw new Error('HTTP ' + response.status);
+                            }
+                            const blobData = await response.blob();
+                            if (blobData instanceof window.Blob) {
+                                const fileReading = new Promise(function (resolve, reject) {
+                                    const fileReader = new FileReader();
+                                    fileReader.onload = function (event) {
+                                        resolve(event.target.result);
+                                    };
+                                    fileReader.onerror = function (error) {
+                                        reject(error);
+                                    }
+                                    fileReader.readAsDataURL(blobData);
+                                });
+
+                                return await fileReading;
+                            } else {
+                                const error = 'Cannot process attachment data.';
+                                Alert.showError(error);
+                                throw new TypeError(error);
+                            }
+                        } catch (error) {
+                            Alert.showError('Cannot retrieve attachment.');
+                            throw error;
+                        }
+                    }
+                }));
+            }
+
+            // encrypt message
+            await ServerInteraction.setCipherMessage(cipherMessage).catch(Alert.showError);
+
+            // send data
+            ServerInteraction.run();
+        };
+
+        return me;
+    })();
+
+    /**
+     * (controller) Responsible for decrypting cipherdata and passing data to view.
+     *
+     * Only decryption, no download.
+     *
+     * @name PasteDecrypter
+     * @class
+     */
+    const PasteDecrypter = (function () {
+        const me = {};
+
+        /**
+         * decrypt data or prompts for password in case of failure
+         *
+         * @name   PasteDecrypter.decryptOrPromptPassword
+         * @private
+         * @async
+         * @function
+         * @param  {string} key
+         * @param  {string} password - optional, may be an empty string
+         * @param  {string} cipherdata
+         * @throws {string}
+         * @return {Promise<false|string>} false, when unsuccessful or string (decrypted data)
+         */
+        async function decryptOrPromptPassword(key, password, cipherdata) {
+            // try decryption without password
+            const plaindata = await CryptTool.decipher(key, password, cipherdata);
+
+            // if it fails, request password
+            if (plaindata.length === 0 && password.length === 0) {
+                // show prompt
+                Prompt.requestPassword();
+
+                // Thus, we cannot do anything yet, we need to wait for the user
+                // input.
+                return false;
+            }
+
+            // if all tries failed, we can only return an error
+            if (plaindata.length === 0) {
+                return false;
+            }
+
+            return plaindata;
+        }
+
+        /**
+         * decrypt the actual document text
+         *
+         * @name   PasteDecrypter.decryptPaste
+         * @private
+         * @async
+         * @function
+         * @param  {Paste} paste - document data in object form
+         * @param  {string} key
+         * @param  {string} password
+         * @throws {string}
+         * @return {Promise}
+         */
+        async function decryptPaste(paste, key, password) {
+            const pastePlain = await decryptOrPromptPassword(
+                key, password,
+                paste.getCipherData()
+            );
+            if (pastePlain === false) {
+                if (password.length === 0) {
+                    throw 'waiting on user to provide a password';
+                } else {
+                    Alert.hideLoading();
+                    // reset password, so it can be re-entered
+                    Prompt.reset();
+                    TopNav.showRetryButton();
+                    throw 'Could not decrypt data. Did you enter a wrong password? Retry with the button at the top.';
+                }
+            }
+
+            const pasteMessage = JSON.parse(pastePlain);
+            if (pasteMessage.hasOwnProperty('attachment') && pasteMessage.hasOwnProperty('attachment_name')) {
+                if (Array.isArray(pasteMessage.attachment) && Array.isArray(pasteMessage.attachment_name)) {
+                    pasteMessage.attachment.forEach((attachment, key) => {
+                        const attachment_name = pasteMessage.attachment_name[key];
+                        AttachmentViewer.setAttachment(attachment, attachment_name);
+                    });
+                } else {
+                    // Continue to process attachment parameters as strings to ensure backward compatibility
+                    AttachmentViewer.setAttachment(pasteMessage.attachment, pasteMessage.attachment_name);
+                }
+                AttachmentViewer.showAttachment();
+            }
+            PasteViewer.setFormat(paste.getFormat());
+            PasteViewer.setText(pasteMessage.paste);
+            PasteViewer.run();
+        }
+
+        /**
+         * decrypts all comments and shows them
+         *
+         * @name   PasteDecrypter.decryptComments
+         * @private
+         * @async
+         * @function
+         * @param  {Paste} paste - document data in object form
+         * @param  {string} key
+         * @param  {string} password
+         * @return {Promise}
+         */
+        async function decryptComments(paste, key, password) {
+            // remove potential previous discussion
+            DiscussionViewer.prepareNewDiscussion();
+
+            const commentDecryptionPromises = [];
+            // iterate over comments
+            for (let i = 0; i < paste.comments.length; ++i) {
+                const comment = new Comment(paste.comments[i]),
+                    commentPromise = CryptTool.decipher(key, password, comment.getCipherData());
+                paste.comments[i] = comment;
+                commentDecryptionPromises.push(
+                    commentPromise.then(function (commentJson) {
+                        const commentMessage = JSON.parse(commentJson);
+                        return [
+                            commentMessage.comment || '',
+                            commentMessage.nickname || ''
+                        ];
+                    })
+                );
+            }
+            return Promise.all(commentDecryptionPromises).then(function (plaintexts) {
+                for (let i = 0; i < paste.comments.length; ++i) {
+                    if (plaintexts[i][0].length === 0) {
+                        continue;
+                    }
+                    DiscussionViewer.addComment(
+                        paste.comments[i],
+                        plaintexts[i][0],
+                        plaintexts[i][1]
+                    );
+                }
+            });
+        }
+
+        /**
+         * show decrypted text in the display area, including discussion (if open)
+         *
+         * @name   PasteDecrypter.run
+         * @function
+         * @param  {Paste} [paste] - (optional) object including comments to display (items = array with keys ('data','meta'))
+         */
+        me.run = function (paste) {
+            Alert.hideMessages();
+            Alert.setCustomHandler(null);
+            Alert.showLoading('Decrypting document…', 'cloud-download');
+
+            if (typeof paste === 'undefined' || paste.type === 'click') {
+                // get cipher data and wait until it is available
+                Model.getPasteData(me.run);
+                return;
+            }
+
+            let key = Model.getPasteKey(),
+                password = Prompt.getPassword(),
+                decryptionPromises = [];
+
+            TopNav.setRetryCallback(function () {
+                TopNav.hideRetryButton();
+                me.run(paste);
+            });
+
+            // Clear attachments to prevent duplicates
+            AttachmentViewer.removeAttachment();
+
+            // decrypt paste & attachments
+            decryptionPromises.push(decryptPaste(paste, key, password));
+
+            // if the discussion is opened on this document, display it
+            if (paste.isDiscussionEnabled()) {
+                decryptionPromises.push(decryptComments(paste, key, password));
+            }
+
+            // shows the remaining time (until) deletion
+            PasteStatus.showRemainingTime(paste);
+
+            CopyToClipboard.showKeyboardShortcutHint();
+
+            Promise.all(decryptionPromises)
+                .then(() => {
+                    Alert.hideLoading();
+                    TopNav.showViewButtons();
+
+                    // discourage cloning (it cannot really be prevented)
+                    if (paste.isBurnAfterReadingEnabled()) {
+                        TopNav.hideBurnAfterReadingButtons();
+                    } else {
+                        // we have to pass in remaining_time here
+                        TopNav.showEmailButton(
+                            paste.getTimeToLive(),
+                            paste.isBurnAfterReadingEnabled()
+                        );
+                    }
+
+                    // only offer adding comments, after document was successfully decrypted
+                    if (paste.isDiscussionEnabled()) {
+                        DiscussionViewer.finishDiscussion();
+                    }
+
+                })
+                .catch((err) => {
+                    // wait for the user to type in the password,
+                    // then PasteDecrypter.run will be called again
+                    Alert.showError(err);
+                });
+        };
+
+        return me;
+    })();
+
+    /**
+     *
+     * @name CopyToClipboard
+     * @class
+     */
+    const CopyToClipboard = (function () {
+        const me = {};
+
+        let copyButton,
+            copyLinkButton,
+            shortcutHint,
+            url;
+
+        /**
+         * Handle copy to clipboard button click
+         *
+         * @name CopyToClipboard.handleCopyButtonClick
+         * @private
+         * @function
+         */
+        function handleCopyButtonClick() {
+            if (!copyButton) return;
+
+            copyButton.addEventListener('click', function () {
+                const text = PasteViewer.getText();
+                saveToClipboard(text);
+
+                showAlertMessage('Document copied to clipboard');
+            });
+        }
+
+        /**
+         * Handle copy link to clipboard button click
+         *
+         * @name CopyToClipboard.handleCopyLinkButtonClick
+         * @private
+         * @function
+         */
+        function handleCopyLinkButtonClick() {
+            if (!copyLinkButton) return;
+
+            copyLinkButton.addEventListener('click', function () {
+                saveToClipboard(url);
+
+                showAlertMessage('Link copied to clipboard');
+            });
+        }
+
+        /**
+         * Handle CTRL+C/CMD+C keyboard shortcut
+         *
+         * @name CopyToClipboard.handleKeyboardShortcut
+         * @private
+         * @function
+         */
+        function handleKeyboardShortcut() {
+            document.addEventListener('copy', function () {
+                if (!isUserSelectedTextToCopy()) {
+                    const text = PasteViewer.getText();
+                    saveToClipboard(text);
+
+                    showAlertMessage('Document copied to clipboard');
+                }
+            });
+        }
+
+        /**
+         * Check if user selected some text on the page to copy it
+         *
+         * @name CopyToClipboard.isUserSelectedTextToCopy
+         * @private
+         * @function
+         * @returns {boolean}
+         */
+        function isUserSelectedTextToCopy() {
+            let text = '';
+
+            if (window.getSelection) {
+                text = window.getSelection().toString();
+            } else if (document.selection && document.selection.type !== 'Control') {
+                text = document.selection.createRange().text;
+            }
+
+            return text.length > 0;
+        }
+
+        /**
+         * Save text to the clipboard
+         *
+         * @name CopyToClipboard.saveToClipboard
+         * @private
+         * @param {string} text
+         * @function
+         */
+        function saveToClipboard(text) {
+            navigator.clipboard.writeText(text);
+        }
+
+        /**
+         * Show alert message after text copy
+         *
+         * @name CopyToClipboard.showAlertMessage
+         * @private
+         * @param {string} message
+         * @function
+         */
+        function showAlertMessage(message) {
+            Alert.showStatus(message);
+        }
+
+        /**
+         * Show keyboard shortcut hint
+         *
+         * @name CopyToClipboard.showKeyboardShortcutHint
+         * @function
+         */
+        me.showKeyboardShortcutHint = function () {
+            shortcutHint.classList.remove('hidden');
+        };
+
+        /**
+         * Hide keyboard shortcut hint
+         *
+         * @name CopyToClipboard.showKeyboardShortcutHint
+         * @function
+         */
+        me.hideKeyboardShortcutHint = function () {
+            shortcutHint.classList.add('hidden');
+        };
+
+        /**
+         * Set document url
+         *
+         * @name CopyToClipboard.setUrl
+         * @param {string} newUrl
+         * @function
+         */
+        me.setUrl = function (newUrl) {
+            url = newUrl;
+        };
+
+        /**
+         * Initialize
+         *
+         * @name CopyToClipboard.init
+         * @function
+         */
+        me.init = function () {
+            copyButton = document.getElementById('copyShortcutHintBtn');
+            copyLinkButton = document.getElementById('copyLink');
+            shortcutHint = document.getElementById('copyShortcutHint');
+
+            handleCopyButtonClick();
+            handleCopyLinkButtonClick();
+            handleKeyboardShortcut();
+        };
+
+        return me;
+    })();
+
+    /**
+     *
+     * @name PasswordPeek
+     * @class
+     */
+    const PasswordPeek = (function () {
+        const me = {};
+
+        /**
+         * Switch between visible and hidden password
+         *
+         * @name PasswordPeek.handleRevealButtonClick
+         * @private
+         * @function
+         */
+        function handleRevealButtonClick() {
+            const element = this;
+            const inputGroup = element.closest('.input-group');
+            const passwordInput = inputGroup ? inputGroup.querySelector('.input-password') : null;
+            if (!passwordInput) {
+                return;
+            }
+
+            const isHidden = passwordInput.getAttribute('type') === 'password';
+            passwordInput.setAttribute('type', isHidden ? 'text' : 'password');
+
+            const tooltip = I18n._(isHidden ? 'Hide password' : 'Show password');
+            element.setAttribute('title', tooltip);
+            element.setAttribute('aria-label', tooltip);
+
+            // handle bootstrap 5 icons: eye & eye-slash
+            const buttonSvg = element.querySelector('use');
+            if (buttonSvg) {
+                const iconHref = buttonSvg.getAttribute('href');
+                if (iconHref) {
+                    buttonSvg.setAttribute('href', isHidden ? `${iconHref}-slash` : iconHref.substring(0, iconHref.length - 6));
+                }
+                return;
+            }
+
+            // handle bootstrap 3 icons: eye-open & eye-close
+            const buttonSpan = element.querySelector('span');
+            if (buttonSpan) {
+                if (isHidden) {
+                    buttonSpan.classList.add('glyphicon-eye-close');
+                    buttonSpan.classList.remove('glyphicon-eye-open');
+                } else {
+                    buttonSpan.classList.add('glyphicon-eye-open');
+                    buttonSpan.classList.remove('glyphicon-eye-close');
+                }
+            }
+        }
+
+        /**
+         * Initialize
+         *
+         * @name PasswordPeek.init
+         * @function
+         */
+        me.init = function () {
+            const revealButton = document.querySelector('.toggle-password');
+            if (!revealButton) {
+                return;
+            }
+            revealButton.addEventListener('click', handleRevealButtonClick);
+        };
+
+        return me;
+    })();
+
+    /**
+     * (controller) main PrivateBin logic
+     *
+     * @name   Controller
+     * @param  {object} window
+     * @param  {object} document
+     * @class
+     */
+    const Controller = (function (window, document) {
+        const me = {};
+
+        /**
+         * hides all status messages no matter which module showed them
+         *
+         * @name   Controller.hideStatusMessages
+         * @function
+         */
+        me.hideStatusMessages = function () {
+            PasteStatus.hideMessages();
+            Alert.hideMessages();
+            CopyToClipboard.hideKeyboardShortcutHint();
+        };
+
+        /**
+         * creates a new document
+         *
+         * @name   Controller.newPaste
+         * @function
+         */
+        me.newPaste = function () {
+            // Important: This *must not* run Alert.hideMessages() as previous
+            // errors from viewing a document should be shown.
+            TopNav.hideAllButtons();
+            Alert.showLoading('Preparing new document…', 'time');
+
+            PasteStatus.hideMessages();
+            PasteViewer.hide();
+            Editor.resetInput();
+            Editor.show();
+            Editor.focusInput();
+            AttachmentViewer.removeAttachment();
+            TopNav.resetInput();
+
+            // reset format
+            PasteViewer.setFormat('plaintext');
+            TopNav.setFormat('plaintext');
+
+            TopNav.showCreateButtons();
+
+            // newPaste could be called when user is on document clone editing view
+            TopNav.hideCustomAttachment();
+            AttachmentViewer.clearDragAndDrop();
+            AttachmentViewer.removeAttachmentData();
+
+            Alert.hideLoading();
+            // only push new state if we are coming from a different one
+            if (Helper.baseUri() !== window.location) {
+                history.pushState({ type: 'create' }, document.title, Helper.baseUri());
+            }
+
+            // clear discussion
+            DiscussionViewer.prepareNewDiscussion();
+        };
+
+        /**
+         * shows the loaded document
+         *
+         * @name   Controller.showPaste
+         * @function
+         */
+        me.showPaste = function () {
+            try {
+                Model.getPasteKey();
+            } catch (err) {
+                console.error(err);
+                Alert.showError('Cannot decrypt document: Decryption key missing in URL (Did you use a redirector or an URL shortener which strips part of the URL?)');
+                return;
+            }
+
+            // check if we should request loading confirmation
+            if (window.location.hash.startsWith(loadConfirmPrefix)) {
+                Prompt.requestLoadConfirmation();
+                return;
+            }
+
+            // show proper elements on screen
+            PasteDecrypter.run();
+        };
+
+        /**
+         * refreshes the loaded document to show potential new data
+         *
+         * @name   Controller.refreshPaste
+         * @function
+         * @param  {function} callback
+         */
+        me.refreshPaste = function (callback) {
+            // save window position to restore it later
+            const orgPosition = window.scrollY;
+
+            Model.getPasteData(function (data) {
+                ServerInteraction.prepare();
+                ServerInteraction.setUrl(Helper.baseUri() + '?pasteid=' + Model.getPasteId());
+
+                ServerInteraction.setFailure(function (status, data) {
+                    // revert loading status…
+                    Alert.hideLoading();
+                    TopNav.showViewButtons();
+
+                    // show error message
+                    Alert.showError(
+                        ServerInteraction.parseUploadError(status, data, 'refresh display')
+                    );
+                });
+                ServerInteraction.setSuccess(function (status, data) {
+                    PasteDecrypter.run(new Paste(data));
+
+                    // NOTE: callback needs to be called (with setTimeout) after a JS
+                    // rendering cycle, as otherwise it would be called before the new content
+                    // is actually rendered, which would cause problems when trying to e.g.
+                    // highlight a comment right after refreshing the document, as the comment would not be in the DOM at that time.
+                    // For scrolling, more timeout is used.
+                    setTimeout(() => {
+                        // restore position instantly (as the process should be instantly)
+                        window.scrollTo({
+                            top: orgPosition,
+                            behavior: 'instant'
+                        });
+
+                        callback();
+                    }, 10);
+                });
+                ServerInteraction.run();
+            }, false); // this false is important as it circumvents the cache
+        };
+
+        /**
+         * clone the current document
+         *
+         * @name   Controller.clonePaste
+         * @function
+         */
+        me.clonePaste = function () {
+            TopNav.collapseBar();
+            TopNav.hideAllButtons();
+
+            // hide messages from previous document
+            me.hideStatusMessages();
+
+            // erase the id and the key in url
+            history.pushState({ type: 'clone' }, document.title, Helper.baseUri());
+
+            if (AttachmentViewer.hasAttachment()) {
+                const attachments = AttachmentViewer.getAttachments();
+                attachments.forEach(attachment => {
+                    AttachmentViewer.moveAttachmentTo(
+                        TopNav.getCustomAttachment(),
+                        attachment,
+                        'Cloned: \'%s\''
+                    );
+                });
+                TopNav.hideFileSelector();
+                AttachmentViewer.hideAttachment();
+                // NOTE: it also looks nice without removing the attachment
+                // but for a consistent display we remove it…
+                AttachmentViewer.hideAttachmentPreview();
+                TopNav.showCustomAttachment();
+
+                // show another status messages to make the user aware that the
+                // files were cloned too!
+                Alert.showStatus(
+                    [
+                        'The cloned file \'%s\' was attached to this document.',
+                        attachments.map(attachment => attachment[1]).join(', ')
+                    ],
+                    'copy'
+                );
+            }
+
+            Editor.setText(PasteViewer.getText());
+            // also clone the format
+            TopNav.setFormat(PasteViewer.getFormat());
+            PasteViewer.hide();
+            Editor.show();
+
+            TopNav.showCreateButtons();
+
+            // clear discussion
+            DiscussionViewer.prepareNewDiscussion();
+        };
+
+        /**
+         * try initializing zlib or display a warning if it fails,
+         * extracted from main init to allow unit testing
+         *
+         * @name   Controller.initZlib
+         * @function
+         */
+        me.initZlib = function () {
+            z = zlib.catch(function () {
+                if (document.body.dataset.compression !== 'none') {
+                    Alert.showWarning('Your browser doesn\'t support WebAssembly, used for zlib compression. You can create uncompressed documents, but can\'t read compressed ones.');
+                }
+            });
+        };
+
+        /**
+         * application start
+         *
+         * @name   Controller.init
+         * @function
+         */
+        me.init = function () {
+            // first load translations
+            I18n.loadTranslations();
+
+            // Add a hook to make all links open a new window
+            DOMPurify.addHook('afterSanitizeAttributes', function (node) {
+                // set all elements owning target to target=_blank
+                if ('target' in node && node.id !== 'pasteurl') {
+                    node.setAttribute('target', '_blank');
+                }
+                // set non-HTML/MathML links to xlink:show=new
+                if (!node.hasAttribute('target')
+                    && (node.hasAttribute('xlink:href')
+                        || node.hasAttribute('href'))) {
+                    node.setAttribute('xlink:show', 'new');
+                }
+                if ('rel' in node) {
+                    node.setAttribute('rel', 'nofollow noopener noreferrer');
+                }
+            });
+
+            // initialize other modules/"classes"
+            Alert.init();
+            Model.init();
+            AttachmentViewer.init();
+            DiscussionViewer.init();
+            Editor.init();
+            PasteStatus.init();
+            PasteViewer.init();
+            Prompt.init();
+            TopNav.init();
+            UiHelper.init();
+            CopyToClipboard.init();
+            PasswordPeek.init();
+
+            // check for legacy browsers before going any further
+            if (!Legacy.Check.getInit()) {
+                // Legacy check didn't complete, wait and try again
+                setTimeout(init, 500);
+                return;
+            }
+            if (!Legacy.Check.getStatus()) {
+                // something major is wrong, stop right away
+                return;
+            }
+            me.initZlib();
+
+            // if delete token is passed (i.e. document has been deleted by this
+            // access), add an event listener for the 'new' document button in the alert
+            if (Model.hasDeleteToken()) {
+                const newFromAlert = document.getElementById('new-from-alert');
+                if (newFromAlert) {
+                    newFromAlert.addEventListener('click', function () {
+                        UiHelper.reloadHome();
+                    });
+                }
+                return;
+            }
+
+            // check whether existing document needs to be shown
+            try {
+                Model.getPasteId();
+            } catch (e) {
+                // otherwise create a new document
+                return me.newPaste();
+            }
+
+            // always reload on back button to invalidate cache (protect burn after read document)
+            window.addEventListener('popstate', () => {
+                window.location.reload();
+            });
+
+            // display an existing document
+            return me.showPaste();
+        };
+
+        return me;
+    })(window, document);
+
+    return {
+        Helper: Helper,
+        I18n: I18n,
+        CryptTool: CryptTool,
+        Model: Model,
+        UiHelper: UiHelper,
+        Alert: Alert,
+        PasteStatus: PasteStatus,
+        Prompt: Prompt,
+        Editor: Editor,
+        PasteViewer: PasteViewer,
+        AttachmentViewer: AttachmentViewer,
+        DiscussionViewer: DiscussionViewer,
+        TopNav: TopNav,
+        ServerInteraction: ServerInteraction,
+        PasteEncrypter: PasteEncrypter,
+        PasteDecrypter: PasteDecrypter,
+        PasswordPeek: PasswordPeek,
+        CopyToClipboard: CopyToClipboard,
+        Controller: Controller
+    };
+})();
+
+// main application start, called when DOM is fully loaded
+// skip auto-initialization in test environments (Node.js)
+if (typeof module === 'undefined' || !module.exports) {
+    window.addEventListener('DOMContentLoaded', function () {
+        // run main controller
+        window.PrivateBin.Controller.init();
+    });
+}

@@ -6,12 +6,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"testing/fstest"
 
 	"github.com/venkatvghub/privatebin-go/internal/config"
 	"github.com/venkatvghub/privatebin-go/internal/obs"
 	"github.com/venkatvghub/privatebin-go/internal/paste"
 	"github.com/venkatvghub/privatebin-go/internal/testdb"
+	"github.com/venkatvghub/privatebin-go/web"
 	"go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -29,13 +29,17 @@ func newTestRouter(t *testing.T, mods ...func(*config.Config)) http.Handler {
 	if err := svc.Migrate(""); err != nil {
 		t.Fatal(err)
 	}
-	static := fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}
+	page := web.IndexData{Name: "privatebin-go"}
+	index, err := web.RenderIndex(page)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := &config.Config{MaxPasteBytes: 1 << 20, MetricsEnabled: true}
 	for _, mod := range mods {
 		mod(cfg)
 	}
 	return NewRouter(Deps{
-		Log: zap.NewNop(), Metrics: obs.NewMetrics(), DB: db, Paste: svc, Static: static, Cfg: cfg,
+		Log: zap.NewNop(), Metrics: obs.NewMetrics(), DB: db, Paste: svc, Static: web.FS(), Index: index, Page: page, Cfg: cfg,
 	})
 }
 
@@ -92,9 +96,6 @@ func TestBurnAfterReading(t *testing.T) {
 	h := newTestRouter(t)
 	created := do(h, "POST", "/", strings.Replace(reqBody, "%d", "1", 1), true)
 	id := created["id"].(string)
-	if got := do(h, "GET", "/api/paste/"+id+"/meta", "", false); got["burn"] != true {
-		t.Fatalf("meta: %v", got)
-	}
 	if first := do(h, "GET", "/?"+id, "", true); first["status"] != float64(0) {
 		t.Fatalf("first read: %v", first)
 	}
@@ -115,7 +116,7 @@ func TestRejects(t *testing.T) {
 		}
 	}
 	// Every route taking a paste id validates its shape before touching the database.
-	for _, target := range []string{"/?not-an-id", "/?pasteid=short", "/api/paste/not-an-id/meta"} {
+	for _, target := range []string{"/?not-an-id", "/?pasteid=short"} {
 		if got := do(h, "GET", target, "", target[:2] == "/?"); got["status"] != float64(1) || got["message"] != msgInvalid {
 			t.Errorf("%s: want %q, got %v", target, msgInvalid, got)
 		}
@@ -156,5 +157,80 @@ func TestMetricsCanBeDisabled(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 404 {
 		t.Fatalf("GET /metrics with metrics disabled: %d, want 404", rec.Code)
+	}
+}
+
+// The PrivateBin interface needs these from the server: its page at "/", the
+// wasm module served as application/wasm, and a CSP that lets it run.
+func TestInterfaceIsServed(t *testing.T) {
+	h := newTestRouter(t)
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		return rec
+	}
+	page := get("/")
+	if page.Code != 200 || !strings.Contains(page.Body.String(), `id="pasteExpiration"`) {
+		t.Fatalf("GET /: %d", page.Code)
+	}
+	csp := page.Header().Get("Content-Security-Policy")
+	for _, want := range []string{"script-src 'self' 'wasm-unsafe-eval'", "frame-ancestors 'none'", "style-src 'self'"} {
+		if !strings.Contains(csp, want) {
+			t.Errorf("CSP lacks %q: %s", want, csp)
+		}
+	}
+	if strings.Contains(csp, "unsafe-inline") {
+		t.Errorf("the page must not allow inline code: %s", csp)
+	}
+	for path, wantType := range map[string]string{
+		"/js/zlib-1.3.2.wasm":            "application/wasm",
+		"/js/privatebin.js":              "javascript",
+		"/css/bootstrap5/privatebin.css": "text/css",
+		"/img/bootstrap-icons.svg":       "image/svg+xml",
+		"/i18n/de.json":                  "json",
+		"/manifest.json":                 "json",
+	} {
+		rec := get(path)
+		if rec.Code != 200 || !strings.Contains(rec.Header().Get("Content-Type"), wantType) {
+			t.Errorf("%s: %d %q, want a %q type", path, rec.Code, rec.Header().Get("Content-Type"), wantType)
+		}
+		if rec.Header().Get("Cache-Control") == "" {
+			t.Errorf("%s: no Cache-Control", path)
+		}
+	}
+	if rec := get("/nope.js"); rec.Code != 404 {
+		t.Errorf("missing file: %d, want 404", rec.Code)
+	}
+}
+
+// PrivateBin's delete link is opened as a page: the server deletes, then shows
+// the interface with a confirmation or the reason it failed.
+func TestDeleteLinkPage(t *testing.T) {
+	h := newTestRouter(t)
+	page := func(path string) string {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != 200 {
+			t.Fatalf("GET %s: %d", path, rec.Code)
+		}
+		return rec.Body.String()
+	}
+	created := do(h, "POST", "/", strings.Replace(reqBody, "%d", "0", 1), true)
+	id, tok := created["id"].(string), created["deletetoken"].(string)
+
+	if body := page("/?pasteid=" + id + "&deletetoken=wrong"); !strings.Contains(body, msgWrongToken) || strings.Contains(body, "new-from-alert") {
+		t.Error("a wrong token must show the error and keep the paste")
+	}
+	if got := do(h, "GET", "/?"+id, "", true); got["status"] != float64(0) {
+		t.Fatalf("paste must survive a wrong token: %v", got)
+	}
+	if body := page("/?pasteid=" + id + "&deletetoken=" + tok); !strings.Contains(body, "Document was properly deleted.") || !strings.Contains(body, `id="new-from-alert"`) {
+		t.Error("the right token must delete and confirm")
+	}
+	if got := do(h, "GET", "/?"+id, "", true); got["status"] != float64(1) {
+		t.Fatalf("paste must be gone: %v", got)
+	}
+	if body := page("/?pasteid=" + id + "&deletetoken=" + tok); !strings.Contains(body, msgNotFound) {
+		t.Error("deleting again must report that the document does not exist")
 	}
 }

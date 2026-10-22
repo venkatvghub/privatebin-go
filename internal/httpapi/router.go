@@ -18,6 +18,7 @@ import (
 	"github.com/venkatvghub/privatebin-go/internal/config"
 	"github.com/venkatvghub/privatebin-go/internal/obs"
 	"github.com/venkatvghub/privatebin-go/internal/paste"
+	"github.com/venkatvghub/privatebin-go/web"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
@@ -30,6 +31,8 @@ type Deps struct {
 	DB      *gorm.DB
 	Auth    *auth.Auth // nil when AUTH_ENABLED=false
 	Static  fs.FS
+	Index   []byte        // the rendered page served at /
+	Page    web.IndexData // its parameters, for the pages that add a status or error
 }
 
 // idRe matches ids from paste.newID; web/js/app.js mirrors it.
@@ -37,9 +40,9 @@ var idRe = regexp.MustCompile(`^[a-f0-9]{16}$`)
 
 // Messages copied from PrivateBin so clients matching on them keep working.
 const (
-	msgNotFound   = "Paste does not exist, has expired or has been deleted."
+	msgNotFound   = "Document does not exist, has expired or has been deleted."
 	msgInvalid    = "Invalid data."
-	msgWrongToken = "Wrong deletion token. Paste was not deleted." // #nosec G101 -- PrivateBin message text, not a credential
+	msgWrongToken = "Wrong deletion token. Document was not deleted." // #nosec G101 -- PrivateBin message text, not a credential
 )
 
 func NewRouter(d Deps) *gin.Engine {
@@ -67,13 +70,16 @@ func NewRouter(d Deps) *gin.Engine {
 	}
 
 	// PrivateBin-compatible JSON API: everything lives on "/".
-	index := d.asset("index.html")
 	r.GET("/", func(c *gin.Context) {
 		if isJSON(c) {
 			d.jsonGet(c)
 			return
 		}
-		index(c)
+		if id, tok := pasteID(c), c.Query("deletetoken"); tok != "" && idRe.MatchString(id) {
+			d.deletePage(c, id, tok) // the delete link is opened as a page, not by script
+			return
+		}
+		c.Data(http.StatusOK, "text/html; charset=utf-8", d.Index)
 	})
 	r.POST("/", append(create, func(c *gin.Context) {
 		if !isJSON(c) {
@@ -86,28 +92,6 @@ func NewRouter(d Deps) *gin.Engine {
 	if d.Cfg.MetricsEnabled {
 		r.GET("/metrics", gin.WrapH(d.Metrics.Handler()))
 	}
-
-	// privatebin-go extensions (not part of PrivateBin's API).
-	r.GET("/api/config", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"authEnabled": d.Auth != nil,
-			"loggedIn":    d.Auth != nil && d.Auth.LoggedIn(c),
-			"maxBytes":    d.Cfg.MaxPasteBytes,
-		})
-	})
-	r.GET("/api/paste/:id/meta", func(c *gin.Context) {
-		id := c.Param("id")
-		if !idRe.MatchString(id) {
-			fail(c, msgInvalid)
-			return
-		}
-		burn, err := d.Paste.IsBurn(id)
-		if err != nil {
-			d.readError(c, err)
-			return
-		}
-		c.JSON(200, gin.H{"status": 0, "burn": burn})
-	})
 
 	if d.Cfg.SwaggerEnabled {
 		r.GET("/openapi.yaml", d.asset("openapi.yaml"))
@@ -192,6 +176,30 @@ func (d Deps) jsonGet(c *gin.Context) {
 	})
 }
 
+// deletePage handles the delete link PrivateBin hands out: deleting, then the
+// interface with a confirmation (or the reason it did not work).
+func (d Deps) deletePage(c *gin.Context, id, tok string) {
+	page := d.Page
+	switch err := d.Paste.Delete(id, tok); {
+	case err == nil:
+		page.Status, page.Deleted = "Document was properly deleted.", true
+	case errors.Is(err, paste.ErrWrongToken):
+		page.Error = msgWrongToken
+	case errors.Is(err, paste.ErrNotFound):
+		page.Error = msgNotFound
+	default:
+		d.Log.Error("delete paste", zap.Error(err))
+		page.Error = "Internal error."
+	}
+	html, err := web.RenderIndex(page)
+	if err != nil {
+		d.serverError(c, "render page", err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", html)
+}
+
 func (d Deps) jsonDelete(c *gin.Context, id, tok string) {
 	switch err := d.Paste.Delete(id, tok); {
 	case errors.Is(err, paste.ErrWrongToken):
@@ -208,7 +216,7 @@ func (d Deps) jsonPost(c *gin.Context) {
 	if err := c.ShouldBindJSON(&in); err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
-			fail(c, fmt.Sprintf("Paste is limited to %s of encrypted data.", humanSize(d.Cfg.MaxPasteBytes)))
+			fail(c, fmt.Sprintf("Document is limited to %s of encrypted data.", humanSize(d.Cfg.MaxPasteBytes)))
 			return
 		}
 		fail(c, msgInvalid)

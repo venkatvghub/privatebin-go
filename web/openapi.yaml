@@ -66,45 +66,9 @@ paths:
                   - $ref: "#/components/schemas/PasteResponse"
                   - $ref: "#/components/schemas/DeleteResponse"
                   - $ref: "#/components/schemas/Error"
-  /api/config:
-    get:
-      summary: Server capabilities (privatebin-go extension)
-      operationId: getConfig
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  authEnabled: { type: boolean }
-                  loggedIn: { type: boolean }
-                  maxBytes: { type: integer, format: int64 }
-  /api/paste/{id}/meta:
-    get:
-      summary: Whether a paste is burn-after-reading, without consuming it (privatebin-go extension)
-      operationId: getPasteMeta
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: OK or an error with `status` 1.
-          content:
-            application/json:
-              schema:
-                oneOf:
-                  - type: object
-                    properties:
-                      status: { type: integer, enum: [0] }
-                      burn: { type: boolean }
-                  - $ref: "#/components/schemas/Error"
   /metrics:
     get:
-      summary: Prometheus metrics (privatebin-go extension; served only when METRICS_ENABLED is true)
+      summary: Prometheus metrics (extension, served only when METRICS_ENABLED is true)
       operationId: metrics
       responses:
         "200":
@@ -190,4 +154,4 @@ components:
       type: object
       properties:
         status: { type: integer, enum: [1] }
-        message: { type: string, example: "Paste does not exist, has expired or has been deleted." }
+        message: { type: string, example: "Document does not exist, has expired or has been deleted." }

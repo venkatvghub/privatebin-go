@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html/template"
 	stdlog "log"
 	"net/http"
 	"os"
@@ -64,9 +65,18 @@ func main() {
 		}
 	}
 
+	page := web.IndexData{
+		Name: cfg.AppTitle, Info: template.HTML(cfg.PageInfo), // #nosec G203 -- operator-supplied footer HTML
+		SyntaxTheme: cfg.SyntaxTheme, AuthEnabled: cfg.AuthEnabled, BurnAfterReading: cfg.BurnAfterReadingDefault,
+	}
+	index, err := web.RenderIndex(page)
+	if err != nil {
+		log.Fatal("render index", zap.Error(err))
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, Metrics: m, Cfg: cfg, Paste: svc, DB: db, Auth: a, Static: web.FS()}),
+		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, Metrics: m, Cfg: cfg, Paste: svc, DB: db, Auth: a, Static: web.FS(), Index: index, Page: page}),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
