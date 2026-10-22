@@ -5,8 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/venkatvghub/privatebin-go/internal/model"
@@ -35,6 +38,11 @@ var Expiries = map[string]time.Duration{
 	"never":  0,
 }
 
+// migrateLockID is an arbitrary application-wide advisory lock key.
+const migrateLockID = 7260211
+
+var prefixRe = regexp.MustCompile(`^[A-Za-z0-9_]*$`)
+
 type Service struct {
 	db   *gorm.DB
 	salt []byte
@@ -52,24 +60,51 @@ func NamingStrategy(prefix string) schema.NamingStrategy {
 func New(db *gorm.DB, salt string) *Service { return &Service{db: db, salt: []byte(salt)} }
 
 // Migrate creates the PrivateBin 2.1.0 tables if absent, with the same DDL
-// PrivateBin uses on PostgreSQL. Existing tables are left untouched.
-func (s *Service) Migrate(prefix string) error { // prefix must already be sanitised (config.Load)
+// PrivateBin uses on PostgreSQL. Existing tables and indexes are left
+// untouched and, importantly, unlocked: CREATE INDEX IF NOT EXISTS takes a
+// SHARE lock on the table before it notices the index exists, which blocks
+// writers and can deadlock with a request holding a row lock.
+func (s *Service) Migrate(prefix string) error {
+	if !prefixRe.MatchString(prefix) {
+		return fmt.Errorf("invalid table prefix %q", prefix)
+	}
 	t := func(name string) string { return `"` + prefix + name + `"` }
-	stmts := []string{
+	tables := []string{
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s ("dataid" CHAR(16) NOT NULL PRIMARY KEY, "data" TEXT, "expiredate" INT, "meta" TEXT)`, t("paste")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s ("dataid" CHAR(16) NOT NULL PRIMARY KEY, "pasteid" CHAR(16), "parentid" CHAR(16), "data" TEXT, "vizhash" TEXT, "postdate" INT)`, t("comment")),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s ("pasteid")`, t("comment_parent"), t("comment")),
-		// Not in PrivateBin (which ignores it): keeps the purge scan cheap.
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s ("expiredate")`, t("paste_expiredate"), t("paste")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s ("id" CHAR(16) NOT NULL PRIMARY KEY, "value" TEXT)`, t("config")),
-		fmt.Sprintf(`INSERT INTO %s VALUES ('VERSION', '%s') ON CONFLICT DO NOTHING`, t("config"), SchemaVersion),
 	}
-	for _, q := range stmts {
-		if err := s.db.Exec(q).Error; err != nil {
+	indexes := []struct{ name, table, column string }{
+		{"comment_parent", "comment", "pasteid"},
+		// Not in PrivateBin (which ignores it): keeps the purge scan cheap.
+		{"paste_expiredate", "paste", "expiredate"},
+	}
+	// CREATE ... IF NOT EXISTS is not safe against concurrent runs (two replicas,
+	// or parallel test packages), so serialise migrations with an advisory lock.
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(?)`, migrateLockID).Error; err != nil {
 			return err
 		}
-	}
-	return nil
+		for _, q := range tables {
+			if err := tx.Exec(q).Error; err != nil {
+				return err
+			}
+		}
+		for _, ix := range indexes {
+			var exists bool
+			if err := tx.Raw(`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ?)`,
+				prefix+ix.name).Scan(&exists).Error; err != nil {
+				return err
+			}
+			if exists {
+				continue
+			}
+			if err := tx.Exec(fmt.Sprintf(`CREATE INDEX %s ON %s (%q)`, t(ix.name), t(ix.table), ix.column)).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Exec(fmt.Sprintf(`INSERT INTO %s VALUES ('VERSION', '%s') ON CONFLICT DO NOTHING`, t("config"), SchemaVersion)).Error
+	})
 }
 
 func newID() (string, error) {
@@ -87,9 +122,23 @@ func (s *Service) deleteToken(id string) string {
 	return hex.EncodeToString(m.Sum(nil))
 }
 
-// Create stores a paste (data is the JSON {v, adata, ct}) and returns its id
-// and delete token.
-func (s *Service) Create(data string, expire time.Duration) (id, deleteToken string, err error) {
+// Create validates and stores a paste. It returns the id, the delete token and
+// whether the paste is burn-after-reading. Unknown or missing expiry keys fall
+// back to one week, as in PrivateBin.
+func (s *Service) Create(in *Input) (id, token string, burn bool, err error) {
+	if burn, err = in.Validate(); err != nil {
+		return
+	}
+	exp, ok := Expiries[in.Meta.Expire]
+	if !ok {
+		exp = Expiries["1week"]
+	}
+	data, _ := json.Marshal(stored{V: in.V, AData: in.AData, CT: json.RawMessage(strconv.Quote(in.CT))})
+	id, token, err = s.insert(string(data), exp)
+	return
+}
+
+func (s *Service) insert(data string, expire time.Duration) (id, deleteToken string, err error) {
 	if id, err = newID(); err != nil {
 		return
 	}
@@ -101,18 +150,68 @@ func (s *Service) Create(data string, expire time.Duration) (id, deleteToken str
 	return id, s.deleteToken(id), s.db.Create(&p).Error
 }
 
+// stored is the JSON kept in paste.data.
+type stored struct {
+	V     float64         `json:"v"`
+	AData json.RawMessage `json:"adata"`
+	CT    json.RawMessage `json:"ct"`
+}
+
+// View is a paste as returned to clients.
+type View struct {
+	ID         string
+	Stored     stored
+	Created    int64
+	TimeToLive *int64 // seconds left; nil when the paste never expires
+	Burned     bool   // read destroyed the paste
+}
+
 func live(db *gorm.DB) *gorm.DB {
 	return db.Where("expiredate = 0 OR expiredate > ?", time.Now().Unix())
 }
 
-// Peek returns a live paste without consuming it.
-func (s *Service) Peek(id string) (*model.Paste, error) {
+// peek returns a live paste without consuming it.
+func (s *Service) peek(id string) (*model.Paste, error) {
 	var p model.Paste
 	err := live(s.db).Where("dataid = ?", id).First(&p).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrNotFound
 	}
 	return &p, err
+}
+
+// Read returns a live paste. A burn-after-reading paste is destroyed in the
+// same call; of concurrent readers exactly one gets it, the rest ErrNotFound.
+func (s *Service) Read(id string) (*View, error) {
+	p, err := s.peek(id)
+	if err != nil {
+		return nil, err
+	}
+	v := &View{ID: id, Created: p.Created()}
+	if err := json.Unmarshal([]byte(p.Data), &v.Stored); err != nil {
+		return nil, fmt.Errorf("corrupt paste %s: %w", id, err)
+	}
+	if model.BurnFlag(v.Stored.AData) {
+		if _, err := s.Take(id); err != nil {
+			return nil, err
+		}
+		v.Burned = true
+	}
+	if p.ExpireDate > 0 {
+		ttl := max(p.ExpireDate-time.Now().Unix(), 0)
+		v.TimeToLive = &ttl
+	}
+	return v, nil
+}
+
+// IsBurn reports whether a live paste is burn-after-reading, without
+// consuming it.
+func (s *Service) IsBurn(id string) (bool, error) {
+	p, err := s.peek(id)
+	if err != nil {
+		return false, err
+	}
+	return p.Burn(), nil
 }
 
 // Take atomically deletes a paste (and its comments) and returns it. Of
@@ -141,7 +240,7 @@ func (s *Service) Take(id string) (*model.Paste, error) {
 // "burnafterreading" is accepted for burn pastes.
 func (s *Service) Delete(id, token string) error {
 	if !hmac.Equal([]byte(s.deleteToken(id)), []byte(token)) {
-		p, err := s.Peek(id)
+		p, err := s.peek(id)
 		if err != nil {
 			return err
 		}

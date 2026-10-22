@@ -25,6 +25,8 @@ func securityHeaders() gin.HandlerFunc {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), interest-cohort=()")
 		c.Next()
 	}
 }
@@ -45,28 +47,76 @@ func bodyLimit(n int64) gin.HandlerFunc {
 	}
 }
 
-// newLimiter is a per-IP token bucket (r tokens/sec, burst b).
-func newLimiter(r rate.Limit, b int) gin.HandlerFunc {
-	var mu sync.Mutex
-	m := map[string]*rate.Limiter{}
-	return func(c *gin.Context) {
-		ip := c.ClientIP()
-		mu.Lock()
-		l, ok := m[ip]
-		if !ok {
-			if len(m) > 10000 {
-				m = map[string]*rate.Limiter{}
-			}
-			l = rate.NewLimiter(r, b)
-			m[ip] = l
+const (
+	limiterIdleTTL   = 10 * time.Minute
+	limiterSweepLen  = 1024 // start evicting idle entries once the map is this big
+	limiterSweepStep = 32   // entries examined per request, so the lock is held O(1)
+)
+
+type visitor struct {
+	lim  *rate.Limiter
+	seen time.Time
+}
+
+// ipLimiter is a per-IP token bucket (rate tokens/sec, burst b). Idle entries
+// are evicted individually, so active clients never get a fresh burst.
+type ipLimiter struct {
+	mu    sync.Mutex
+	m     map[string]*visitor
+	rate  rate.Limit
+	burst int
+}
+
+func (l *ipLimiter) allow(ip string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.m) > limiterSweepLen {
+		l.sweep(now)
+	}
+	v, ok := l.m[ip]
+	if !ok {
+		v = &visitor{lim: rate.NewLimiter(l.rate, l.burst)}
+		l.m[ip] = v
+	}
+	v.seen = now
+	return v.lim.Allow()
+}
+
+// sweep examines at most limiterSweepStep entries. Go starts map iteration at a
+// random entry, so repeated bounded sweeps reach every entry over time while a
+// single request never scans the whole map under the lock.
+func (l *ipLimiter) sweep(now time.Time) {
+	n := 0
+	for k, v := range l.m {
+		if now.Sub(v.seen) > limiterIdleTTL {
+			delete(l.m, k)
 		}
-		mu.Unlock()
-		if !l.Allow() {
+		if n++; n >= limiterSweepStep {
+			return
+		}
+	}
+}
+
+func newLimiter(r rate.Limit, b int) gin.HandlerFunc {
+	l := &ipLimiter{m: map[string]*visitor{}, rate: r, burst: b}
+	return func(c *gin.Context) {
+		if !l.allow(c.ClientIP(), time.Now()) {
 			fail(c, "Please wait 1 seconds between each post.")
 			return
 		}
 		c.Next()
 	}
+}
+
+// setStaticCache lets browsers reuse an embedded asset. Assets carry no
+// validators, so expiry is time based: libraries for a day, our own files for
+// an hour.
+func setStaticCache(c *gin.Context) {
+	age := 3600
+	if strings.HasPrefix(c.Request.URL.Path, "/vendor/") {
+		age = 86400
+	}
+	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(age))
 }
 
 // observe logs one JSON line per request and records metrics. It logs the

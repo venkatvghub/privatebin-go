@@ -22,14 +22,14 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-privatebin}:${POSTGRES_PASSWORD:-privatebin}@db:5432/${POSTGRES_DB:-privatebin}?sslmode=disable
     ports:
       - "8080:8080"
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     depends_on:
       db:
         condition: service_healthy
 
   dex:
     profiles: ["auth"]
-    image: ghcr.io/dexidp/dex:latest
+    image: ghcr.io/dexidp/dex:v2.46.1
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     volumes:
       - ./dex/config.yaml:/etc/dex/config.yaml:ro

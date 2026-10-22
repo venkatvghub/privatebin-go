@@ -54,7 +54,8 @@ Read from environment variables; a `.env` file (gitignored) is loaded if present
 | `TABLE_PREFIX` | empty | table prefix (PrivateBin `tbl` option) |
 | `SWAGGER_ENABLED` | `true` | serve `/swagger/` and `/openapi.yaml` |
 | `AUTH_ENABLED` | `false` | require OIDC login to create pastes |
-| `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `SESSION_SECRET`, `COOKIE_SECURE` | | needed when `AUTH_ENABLED=true` (`SESSION_SECRET` 32+ chars) |
+| `TRUSTED_PROXIES` | empty | comma separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted. Leave empty unless behind a reverse proxy, otherwise the per-IP rate limit can be spoofed |
+| `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `SESSION_SECRET` | | needed when `AUTH_ENABLED=true` (`SESSION_SECRET` 32+ chars). Cookies are `Secure` when `BASE_URL` starts with `https://` |
 
 ## API
 
@@ -80,9 +81,13 @@ comment(dataid, pasteid, parentid, data, vizhash, postdate)
 config(id CHAR(16) PK, value TEXT)    -- VERSION row
 ```
 
+## Security
+
+Checked against the OWASP Top 10 (2021); see `SECURITY.md` for the review and how to report issues. `make audit` runs `govulncheck` and `gosec`.
+
 ## Building
 
-Requires Go (see `go.mod`) and Docker.
+Requires Go (see `go.mod`) and Docker. Generate secrets with `openssl rand -hex 32`; the app refuses to start with the `.env.example` placeholders.
 
 ```bash
 go build -o privatebin-go ./cmd/privatebin-go     # needs DATABASE_URL, APP_NAME, DELETE_SALT
@@ -94,12 +99,13 @@ docker build -t privatebin-go .              # Chainguard go -> Chainguard stati
 
 ```bash
 go vet ./...
-go test ./...                          # DB tests skip unless TEST_DATABASE_URL is set
+go test ./...                          # DB tests skip locally without TEST_DATABASE_URL and fail when CI is set
 # with the compose database (port is not published; run inside the network):
 docker run --rm --network privatebin-go_default -v "$PWD":/src -w /src \
   -e TEST_DATABASE_URL='postgres://privatebin:privatebin@db:5432/privatebin?sslmode=disable' \
   cgr.dev/chainguard/go:latest test ./...
 make deadcode                          # golang.org/x/tools deadcode
+make audit                             # govulncheck + gosec
 ```
 
 ## Contributing
