@@ -278,3 +278,17 @@ func TestMessagesAreKnownToPrivateBin(t *testing.T) {
 		t.Errorf("size limit message: %v", got)
 	}
 }
+
+// The policy is PrivateBin 2.1.0's default (lib/Configuration.php, 'cspheader')
+// except for the one documented narrowing of connect-src. The literal below is
+// transcribed from that file, not taken from the production constant.
+func TestCSPMatchesPrivateBin210(t *testing.T) {
+	const privateBin210 = "default-src 'none'; base-uri 'self'; form-action 'none'; manifest-src 'self'; " +
+		"connect-src * blob:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self'; " +
+		"frame-ancestors 'none'; frame-src blob:; img-src 'self' data: blob:; media-src blob:; object-src blob:; " +
+		"sandbox allow-same-origin allow-scripts allow-forms allow-modals allow-downloads"
+	want := strings.Replace(privateBin210, "connect-src * blob:", "connect-src 'self' blob:", 1)
+	if baseCSP != want {
+		t.Errorf("CSP differs from PrivateBin 2.1.0's default beyond connect-src:\n got %s\nwant %s", baseCSP, want)
+	}
+}

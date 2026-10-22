@@ -15,8 +15,11 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// baseCSP is PrivateBin's default policy (the interface is built for it), with
-// connect-src narrowed from * to this origin: the app only talks to itself.
+// baseCSP is PrivateBin 2.1.0's default policy (the interface is built for it:
+// lib/Configuration.php, 'cspheader'), identical except that connect-src is
+// narrowed from * to this origin, since the app only talks to itself. 2.1.0's
+// sandbox has no allow-popups and its base-uri is 'self'; TestCSPMatchesPrivateBin210
+// pins all of it.
 const baseCSP = "default-src 'none'; base-uri 'self'; form-action 'none'; manifest-src 'self'; connect-src 'self' blob:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self'; frame-ancestors 'none'; frame-src blob:; img-src 'self' data: blob:; media-src blob:; object-src blob:; sandbox allow-same-origin allow-scripts allow-forms allow-modals allow-downloads"
 
 func securityHeaders() gin.HandlerFunc {
