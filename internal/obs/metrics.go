@@ -34,8 +34,7 @@ func NewMetrics() *Metrics {
 	return m
 }
 
+// Handler serves the Prometheus exposition format.
 func (m *Metrics) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{}))
-	return mux
+	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{})
 }

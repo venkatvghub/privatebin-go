@@ -83,6 +83,10 @@ func NewRouter(d Deps) *gin.Engine {
 		d.jsonPost(c)
 	})...)
 
+	if d.Cfg.MetricsEnabled {
+		r.GET("/metrics", gin.WrapH(d.Metrics.Handler()))
+	}
+
 	// privatebin-go extensions (not part of PrivateBin's API).
 	r.GET("/api/config", func(c *gin.Context) {
 		c.JSON(200, gin.H{

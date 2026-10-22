@@ -12,9 +12,10 @@ import (
 )
 
 type Config struct {
-	AppName     string `env:"APP_NAME,notEmpty"`
-	LogLevel    string `env:"LOG_LEVEL" envDefault:"info"`
-	MetricsAddr string `env:"METRICS_ADDR" envDefault:":9090"` // empty disables metrics
+	AppName  string `env:"APP_NAME,notEmpty"`
+	LogLevel string `env:"LOG_LEVEL" envDefault:"info"`
+	// MetricsEnabled serves Prometheus metrics on the app port at /metrics.
+	MetricsEnabled bool `env:"METRICS_ENABLED" envDefault:"true"`
 
 	DatabaseURL string `env:"DATABASE_URL,notEmpty"`
 	// TablePrefix is PrivateBin's "tbl" option. It is spliced into DDL, so it is

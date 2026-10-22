@@ -7,5 +7,5 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/privatebin-go ./cm
 
 FROM cgr.dev/chainguard/static:latest
 COPY --from=build /out/privatebin-go /privatebin-go
-EXPOSE 8080 9090
+EXPOSE 8080
 ENTRYPOINT ["/privatebin-go"]

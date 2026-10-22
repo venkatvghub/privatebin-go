@@ -19,7 +19,7 @@ import (
 
 const reqBody = `{"v":2,"adata":[["AAAAAAAAAAAAAAAA","AAAAAAAAAAA=",100000,256,128,"aes","gcm","none"],"plaintext",0,%d],"ct":"AAAA","meta":{"expire":"5min"}}`
 
-func newTestRouter(t *testing.T) http.Handler {
+func newTestRouter(t *testing.T, mods ...func(*config.Config)) http.Handler {
 	t.Helper()
 	db, err := gorm.Open(postgres.Open(testdb.DSN(t)), &gorm.Config{NamingStrategy: paste.NamingStrategy("")})
 	if err != nil {
@@ -30,9 +30,12 @@ func newTestRouter(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	static := fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}
+	cfg := &config.Config{MaxPasteBytes: 1 << 20, MetricsEnabled: true}
+	for _, mod := range mods {
+		mod(cfg)
+	}
 	return NewRouter(Deps{
-		Log: zap.NewNop(), Metrics: obs.NewMetrics(), DB: db, Paste: svc, Static: static,
-		Cfg: &config.Config{MaxPasteBytes: 1 << 20},
+		Log: zap.NewNop(), Metrics: obs.NewMetrics(), DB: db, Paste: svc, Static: static, Cfg: cfg,
 	})
 }
 
@@ -119,5 +122,39 @@ func TestRejects(t *testing.T) {
 	}
 	if got := do(h, "POST", "/", strings.Replace(reqBody, "%d", "0", 1), false); got["status"] != float64(1) {
 		t.Errorf("POST without JSON header must be rejected: %v", got)
+	}
+}
+
+func TestMetricsOnAppPort(t *testing.T) {
+	h := newTestRouter(t)
+	created := do(h, "POST", "/", strings.Replace(reqBody, "%d", "0", 1), true)
+	id := created["id"].(string)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	if rec.Code != 200 {
+		t.Fatalf("GET /metrics: %d", rec.Code)
+	}
+	for _, want := range []string{
+		`privatebin_go_http_requests_total{method="POST",route="/",status="200"}`,
+		`privatebin_go_pastes_created_total{burn="false"} 1`,
+		"go_goroutines",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+	if strings.Contains(body, id) || strings.Contains(body, created["deletetoken"].(string)) {
+		t.Error("metrics must never carry a paste id or delete token")
+	}
+}
+
+func TestMetricsCanBeDisabled(t *testing.T) {
+	h := newTestRouter(t, func(c *config.Config) { c.MetricsEnabled = false })
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if rec.Code != 404 {
+		t.Fatalf("GET /metrics with metrics disabled: %d, want 404", rec.Code)
 	}
 }
