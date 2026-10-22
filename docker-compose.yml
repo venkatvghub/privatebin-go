@@ -29,7 +29,7 @@ services:
 
   dex:
     profiles: ["auth"]
-    image: ghcr.io/dexidp/dex:latest
+    image: ghcr.io/dexidp/dex:v2.46.1
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     volumes:
       - ./dex/config.yaml:/etc/dex/config.yaml:ro
