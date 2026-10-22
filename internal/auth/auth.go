@@ -107,6 +107,9 @@ func (a *Auth) login(c *gin.Context) {
 
 func (a *Auth) callback(c *gin.Context) {
 	raw, _ := c.Cookie(flowCookie)
+	// The flow cookie is single use: drop it whatever the outcome, so a failed
+	// attempt cannot leave a stale one behind to confuse the next try.
+	a.setCookie(c, flowCookie, "", -time.Second)
 	var f flow
 	if a.flow.Decode(flowCookie, raw, &f) != nil || c.Query("state") != f.State {
 		c.String(http.StatusBadRequest, "invalid login state")
@@ -128,7 +131,6 @@ func (a *Auth) callback(c *gin.Context) {
 		c.String(http.StatusInternalServerError, "login unavailable")
 		return
 	}
-	a.setCookie(c, flowCookie, "", -time.Second)
 	a.setCookie(c, sessionCookie, enc, sessionTTL)
 	c.Redirect(http.StatusFound, "/")
 }
